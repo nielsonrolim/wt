@@ -1,0 +1,17 @@
+# A Rails app with Postgres in docker compose and Active Storage on disk.
+# The source (<project>-postgres-1), its volume and its image/command/env are
+# all read from the running compose container.
+
+[app]
+copy = ["storage"]   # Active Storage blobs the cloned database points at
+
+[services.postgres]
+
+[hooks]
+setup = [
+  ["bundle", "install"],
+  ["bun", "install"],
+]
+after_services = [
+  ["bin/rails", "db:prepare"],
+]
