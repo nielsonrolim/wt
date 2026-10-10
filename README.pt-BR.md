@@ -234,3 +234,7 @@ cargo test                          # testes unitários
 cargo clippy --all-targets -- -D warnings
 tests/e2e.sh                        # ciclo completo contra um compose descartável (Postgres + Redis + SQLite)
 ```
+
+## Licença
+
+[MIT](LICENSE)
