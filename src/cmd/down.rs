@@ -260,7 +260,7 @@ fn check_dirty(env: &Env, force: bool) -> Result<()> {
 }
 
 fn confirm(slug: &str, opts: &Options) -> Result<()> {
-    if opts.yes || opts.force || env::var("WT_YES").as_deref() == Ok("1") {
+    if opts.yes || env::var("WT_YES").as_deref() == Ok("1") {
         return Ok(());
     }
     if !std::io::stdin().is_terminal() {

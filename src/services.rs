@@ -204,13 +204,25 @@ impl Drop for RestoreOnDrop {
 // Volume, container, readiness
 // ---------------------------------------------------------------------------
 
-fn marker_present(image: &str, volume: &str) -> bool {
-    docker::run_shell(
+/// Whether a finished copy left its marker. An error means the check itself
+/// failed (daemon, image, no `sh`), which says nothing about the volume, so
+/// the caller must not treat it as a half-copy and discard the data.
+fn marker_present(image: &str, volume: &str) -> Result<bool> {
+    let out = docker::run_shell(
         image,
         &[format!("{volume}:/v")],
-        &format!("test -f /v/{CLONE_MARKER}"),
+        &format!("if [ -f /v/{CLONE_MARKER} ]; then echo yes; else echo no; fi"),
     )
-    .is_ok()
+    .with_context(|| format!("could not check whether {volume} is a finished copy"))?;
+    parse_marker(&out)
+}
+
+fn parse_marker(out: &str) -> Result<bool> {
+    match out.trim() {
+        "yes" => Ok(true),
+        "no" => Ok(false),
+        other => bail!("unexpected marker check output: {other:?}"),
+    }
 }
 
 /// Creates the clone's volume: a byte copy of the source, or empty when the
@@ -230,7 +242,7 @@ pub fn prepare_volume(svc: &Service, src: &Source, env: &Env) -> Result<()> {
     }
 
     if docker::volume(&volume).is_some() {
-        if marker_present(image, &volume) {
+        if marker_present(image, &volume)? {
             println!("Reusing {volume}");
             return Ok(());
         }
@@ -242,8 +254,10 @@ pub fn prepare_volume(svc: &Service, src: &Source, env: &Env) -> Result<()> {
     let source = src.container.name().to_string();
     if src.container.state.running {
         println!("Stopping {source} (it is down for the few seconds of the copy)");
-        docker::stop(&source)?;
+        // Registered before the stop: a Ctrl-C while `docker stop` waits still
+        // lets the daemon finish stopping it, and the handler must restart it.
         STOPPED.lock().expect("lock").push(source.clone());
+        docker::stop(&source)?;
     }
 
     docker::create_volume(&volume, &labels)?;
@@ -438,5 +452,14 @@ mod tests {
         for pair in ranges.windows(2) {
             assert!(pair[0].1 < pair[1].0, "{pair:?}");
         }
+    }
+
+    #[test]
+    fn marker_check_only_reports_what_it_saw() {
+        assert!(parse_marker("yes\n").unwrap());
+        assert!(!parse_marker("no\n").unwrap());
+        // Anything else, e.g. an image that prints a banner, is not "no".
+        assert!(parse_marker("").is_err());
+        assert!(parse_marker("Welcome\nno").is_err());
     }
 }
