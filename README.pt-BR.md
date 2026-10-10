@@ -38,7 +38,7 @@ Roda do checkout principal. Um branch existente é feito checkout; um desconheci
 
 Passos, nesta ordem:
 
-1. Cria a worktree em `<root>/<slug>` (via Herdr, se disponível; senão `git worktree add`). O slug é o branch em minúsculas, com qualquer outro caractere virando `-`, até 40 caracteres: `feat/ENG-12_x` → `feat-eng-12-x`.
+1. Cria a worktree em `<root>/<slug>` (via Herdr, se disponível; senão `git worktree add`). O slug é o branch em minúsculas, com qualquer outro caractere virando `-`, até 40 caracteres: `feat/ENG-12_x` → `feat-eng-12-x`. Um branch cujo slug já pertence à worktree de outro branch (`feat/x` e `feat-x`) é recusado.
 2. Escolhe as portas: a porta web e uma por serviço, cada uma na sua faixa, pulando as que algum container (mesmo parado) publica, as que outra worktree de qualquer projeto já recebeu e as que têm algo escutando.
 3. Escreve o `.env` da worktree (copiado do principal na primeira vez) e o `.envrc`.
 4. Copia os arquivos SQLite e os caminhos de `app.copy`.
@@ -116,7 +116,7 @@ after_services = []         # depois que os serviços estão prontos
 
 A chave de `[services.<tipo>]` é o próprio tipo: `postgres`, `mysql`, `redis` ou `sqlite`. Qualquer outra é erro, e cada app tem no máximo um serviço de cada tipo. Uma tabela vazia, como `[services.postgres]`, basta quando o compose segue o padrão.
 
-O clone não repete nada do compose no config: imagem, comando, variáveis de ambiente, usuário, porta interna e diretório de dados são lidos do container de origem com `docker inspect`, então o clone sempre sobe exatamente como a origem. O volume de dados é o montado no diretório de dados padrão do tipo; se não houver, o único volume do container; se houver mais de um e nenhum no lugar padrão, use `volume`. Dados num bind mount não são suportados.
+O clone não repete nada do compose no config: imagem, comando, variáveis de ambiente, usuário, porta interna e diretório de dados são lidos do container de origem com `docker inspect`, então o clone sempre sobe exatamente como a origem. O volume de dados é o montado no diretório de dados padrão do tipo; se não houver, o único volume do container; se houver mais de um e nenhum no lugar padrão, use `volume`. Dados num bind mount não são suportados. Quando a origem publica várias portas (3306 e 33060 do MySQL), o clone usa a porta padrão do tipo se ela estiver entre elas; senão, a menor porta TCP.
 
 | | Postgres | MySQL/MariaDB | Redis/Valkey | SQLite |
 |---|---|---|---|---|
@@ -133,7 +133,7 @@ As faixas não se sobrepõem entre si nem com a porta web, e ficam todas acima d
 
 ### O banco principal durante o clone
 
-Uma cópia byte a byte precisa do banco parado: um diretório de dados vivo tem páginas pela metade. Por isso o `wt up` para o container de origem (`docker stop`), copia o volume e o liga de novo. Ele fica fora do ar só pelos segundos da cópia, e volta mesmo se a cópia falhar ou você apertar Ctrl-C. Isso só acontece na primeira vez: um volume já clonado é reaproveitado nos re-runs. Um volume com a cópia pela metade (sem o marcador `.wt-clone-complete`) é descartado e copiado de novo.
+Uma cópia byte a byte precisa do banco parado: um diretório de dados vivo tem páginas pela metade. Por isso o `wt up` para o container de origem (`docker stop`), copia o volume e o liga de novo. Ele fica fora do ar só pelos segundos da cópia, e volta mesmo se a cópia falhar ou você apertar Ctrl-C. Isso só acontece na primeira vez: um volume já clonado é reaproveitado nos re-runs. Um volume com a cópia pela metade (sem o marcador `.wt-clone-complete`) é descartado e copiado de novo. Se a própria checagem do marcador não conseguir rodar, o `wt up` para com erro e não mexe no volume.
 
 O SQLite não para nada: `sqlite3 .backup` tira uma cópia consistente mesmo com a app usando o arquivo. Sem o CLI `sqlite3`, o `wt` copia o arquivo e o `-wal`/`-shm`. Cada arquivo é copiado uma vez só; apague o da worktree para copiar de novo.
 

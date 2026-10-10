@@ -166,7 +166,7 @@ pub fn resolve_source(svc: &Service) -> Result<Source> {
         volume: mount.name.clone().unwrap_or_default(),
         data_dir: mount.destination.clone(),
         container_port: container
-            .container_port()
+            .container_port(svc.kind.default_container_port())
             .unwrap_or(svc.kind.default_container_port()),
         container,
     })

@@ -96,10 +96,22 @@ impl Container {
             .collect()
     }
 
-    /// The first published container port, e.g. 5432 from "5432/tcp".
-    pub fn container_port(&self) -> Option<u16> {
-        self.bindings()
-            .find_map(|(key, _)| key.split('/').next()?.parse().ok())
+    /// The published TCP container port the service listens on, e.g. 5432
+    /// from "5432/tcp". With several (MySQL's 3306 and 33060), `preferred`
+    /// wins when published; otherwise the lowest, so the pick never depends
+    /// on map order.
+    pub fn container_port(&self, preferred: u16) -> Option<u16> {
+        let ports: Vec<u16> = self
+            .bindings()
+            .filter_map(|(key, _)| {
+                let (port, proto) = key.split_once('/').unwrap_or((key, "tcp"));
+                (proto == "tcp").then(|| port.parse().ok()).flatten()
+            })
+            .collect();
+        if ports.contains(&preferred) {
+            return Some(preferred);
+        }
+        ports.into_iter().min()
     }
 
     fn bindings(&self) -> impl Iterator<Item = (&String, &Vec<PortBinding>)> {
@@ -321,7 +333,7 @@ mod tests {
         assert_eq!(c.env_value("POSTGRES_USER"), Some("app"));
         assert_eq!(c.env_value("POSTGRES"), None);
         assert_eq!(c.host_ports(), vec![5432]);
-        assert_eq!(c.container_port(), Some(5432));
+        assert_eq!(c.container_port(5432), Some(5432));
         assert_eq!(c.label("com.docker.compose.service"), Some("postgres"));
         let vols: Vec<_> = c.volume_mounts().collect();
         assert_eq!(vols.len(), 1);
@@ -335,6 +347,30 @@ mod tests {
         let c: Vec<Container> = serde_json::from_str(json).unwrap();
         assert!(c[0].host_ports().is_empty());
         assert!(c[0].env().is_empty());
-        assert_eq!(c[0].container_port(), None);
+        assert_eq!(c[0].container_port(6379), None);
+    }
+
+    fn with_bindings(bindings: &str) -> Container {
+        let json = format!(
+            r#"[{{"Name": "/x", "Config": {{"Image": "mysql"}}, "State": {{"Running": true}},
+            "Mounts": [], "HostConfig": {{"PortBindings": {bindings}}}}}]"#
+        );
+        serde_json::from_str::<Vec<Container>>(&json)
+            .unwrap()
+            .remove(0)
+    }
+
+    #[test]
+    fn container_port_prefers_the_service_port() {
+        let c = with_bindings(
+            r#"{"33060/tcp": [{"HostPort": "33060"}], "3306/tcp": [{"HostPort": "3306"}]}"#,
+        );
+        assert_eq!(c.container_port(3306), Some(3306));
+        // Without the preferred one published, the pick is still stable.
+        assert_eq!(c.container_port(9999), Some(3306));
+        let c = with_bindings(
+            r#"{"53/udp": [{"HostPort": "53"}], "3307/tcp": [{"HostPort": "3307"}]}"#,
+        );
+        assert_eq!(c.container_port(3306), Some(3307));
     }
 }

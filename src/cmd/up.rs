@@ -66,7 +66,15 @@ pub fn run(branch: &str, base: Option<&str>) -> Result<()> {
 
 fn create_worktree(main: &Path, env: &Env, branch: &str, base: Option<&str>) -> Result<()> {
     let path = &env.path;
-    if git::registered(main, path)? {
+    if let Some(existing) = git::list(main)?.into_iter().find(|e| &e.path == path) {
+        // Another branch can share the slug (feat/x and feat-x); reusing its
+        // checkout would hand this branch the other one's databases.
+        if let Some(other) = existing.branch.filter(|b| b != branch) {
+            bail!(
+                "{} already holds branch {other}, which has the same slug as {branch}",
+                path.display()
+            );
+        }
         println!("Reusing worktree at {}", path.display());
         return Ok(());
     }

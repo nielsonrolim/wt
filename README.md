@@ -38,7 +38,7 @@ Run it from the main checkout. If the branch exists, `wt` checks it out; otherwi
 
 Steps, in order:
 
-1. Creates the worktree at `<root>/<slug>`, through Herdr if it is available and with `git worktree add` otherwise. The slug is the branch name lowercased, with every other character turned into `-`, up to 40 characters: `feat/ENG-12_x` → `feat-eng-12-x`.
+1. Creates the worktree at `<root>/<slug>`, through Herdr if it is available and with `git worktree add` otherwise. The slug is the branch name lowercased, with every other character turned into `-`, up to 40 characters: `feat/ENG-12_x` → `feat-eng-12-x`. A branch whose slug is already taken by another branch's worktree (`feat/x` and `feat-x`) is refused.
 2. Picks the ports: the web port and one per service, each from its own range. It skips ports published by any container (stopped ones included), ports already given to another worktree of any project, and ports something is listening on.
 3. Writes the worktree's `.env`, copied from the main checkout the first time, and `.envrc`.
 4. Copies the SQLite files and the `app.copy` paths.
@@ -124,7 +124,7 @@ after_services = []         # once the services are ready
 
 The key of `[services.<type>]` is the type itself: `postgres`, `mysql`, `redis` or `sqlite`. Any other key is an error, and each app has at most one service of each type. An empty table such as `[services.postgres]` is enough when compose follows its default naming.
 
-The config repeats nothing from compose. `wt` reads the image, command, environment variables, user, container port and data directory from the source container with `docker inspect`, so the clone always boots exactly like the source. The data volume is the one mounted at the type's default data directory. Failing that, it is the container's only volume. If there are several and none sits in the default place, set `volume`. Data in a bind mount is not supported.
+The config repeats nothing from compose. `wt` reads the image, command, environment variables, user, container port and data directory from the source container with `docker inspect`, so the clone always boots exactly like the source. The data volume is the one mounted at the type's default data directory. Failing that, it is the container's only volume. If there are several and none sits in the default place, set `volume`. Data in a bind mount is not supported. When the source publishes several ports (MySQL's 3306 and 33060), the clone uses the type's standard port if it is among them, and the lowest TCP port otherwise.
 
 | | Postgres | MySQL/MariaDB | Redis/Valkey | SQLite |
 |---|---|---|---|---|
@@ -141,7 +141,7 @@ The ranges don't overlap each other or the web port. Each sits above its databas
 
 ### The main database during the clone
 
-A byte-for-byte copy needs the database at rest, because a live data directory holds half-written pages. So `wt up` stops the source container (`docker stop`), copies the volume and starts it again. The source is down only for the seconds the copy takes, and comes back even if the copy fails or you press Ctrl-C. This happens only the first time, since re-runs reuse a cloned volume. A half-copied volume (one without the `.wt-clone-complete` marker) is discarded and copied again.
+A byte-for-byte copy needs the database at rest, because a live data directory holds half-written pages. So `wt up` stops the source container (`docker stop`), copies the volume and starts it again. The source is down only for the seconds the copy takes, and comes back even if the copy fails or you press Ctrl-C. This happens only the first time, since re-runs reuse a cloned volume. A half-copied volume (one without the `.wt-clone-complete` marker) is discarded and copied again. If the marker check itself cannot run, `wt up` stops with an error and leaves the volume alone.
 
 SQLite stops nothing: `sqlite3 .backup` takes a consistent copy even while the app has the file open. Without the `sqlite3` CLI, `wt` copies the file along with its `-wal`/`-shm` files. Each file is copied only once; delete the worktree's copy to copy it again.
 

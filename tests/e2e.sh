@@ -139,6 +139,10 @@ grep -q "Reusing $PROJECT-wt-feat-x-postgres-data" "$WORK/rerun.log" || fail "vo
 grep -q '^LOCAL=1$' "$WTP/.env" || fail "hand edit lost"
 [ "$(grep -c 'Written by wt up' "$WTP/.env")" = 1 ] || fail "banner stacked"
 
+step "a branch with the same slug is refused"
+"$WT" up feat-x 2>/dev/null && fail "feat-x reused feat/x's worktree"
+[ "$(git -C "$WTP" rev-parse --abbrev-ref HEAD)" = feat/x ] || fail "feat/x checkout changed"
+
 step "second worktree gets different ports"
 "$WT" up feat/y >/dev/null
 [ "$(sed -n 's/^DB_PORT=//p' "$WORK/root/feat-y/.env")" != "$PG_PORT" ] || fail "pg port reused"
