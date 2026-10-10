@@ -162,6 +162,10 @@ pub fn resolve_source(svc: &Service) -> Result<Source> {
         }
     };
 
+    if svc.clone {
+        check_self_contained(svc.kind, &container, &mount.destination)?;
+    }
+
     Ok(Source {
         volume: mount.name.clone().unwrap_or_default(),
         data_dir: mount.destination.clone(),
@@ -170,6 +174,35 @@ pub fn resolve_source(svc: &Service) -> Result<Source> {
             .unwrap_or(svc.kind.default_container_port()),
         container,
     })
+}
+
+/// Refuses a source whose data does not all live in the data volume. Only
+/// that volume is copied, and the clone gets none of the source's other
+/// writable mounts, so it would boot with part of its data missing: with
+/// Postgres, a WAL that no longer matches the copied data files.
+fn check_self_contained(kind: Kind, container: &Container, data_dir: &str) -> Result<()> {
+    let source = container.name();
+    let inside = format!("{}/", data_dir.trim_end_matches('/'));
+    if let Some(m) = container
+        .mounts
+        .iter()
+        .find(|m| m.destination.starts_with(&inside))
+    {
+        bail!(
+            "{source} mounts {} inside its data dir {data_dir}; wt copies only the data volume, so the clone would miss it (set clone = false to start empty)",
+            m.destination
+        );
+    }
+    if kind == Kind::Postgres
+        && let Some(dir) = container
+            .env_value("POSTGRES_INITDB_WALDIR")
+            .filter(|d| !d.is_empty())
+    {
+        bail!(
+            "{source} keeps its WAL in {dir}, outside the data volume; wt copies only the data volume, so the clone would boot without it (set clone = false to start empty)"
+        );
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -533,5 +566,34 @@ mod tests {
                 "/tmp"
             ]
         );
+    }
+
+    fn container_with(mounts: &str, env: &str) -> Container {
+        let json = format!(
+            r#"[{{"Name": "/db", "Config": {{"Image": "postgres", "Env": {env}}},
+            "State": {{"Running": true}}, "Mounts": {mounts}, "HostConfig": {{}}}}]"#
+        );
+        serde_json::from_str::<Vec<Container>>(&json)
+            .unwrap()
+            .remove(0)
+    }
+
+    #[test]
+    fn refuses_data_outside_the_data_volume() {
+        let dir = "/var/lib/postgresql/data";
+        let data = r#"{"Type": "volume", "Name": "db", "Destination": "/var/lib/postgresql/data"}"#;
+        let conf = r#"{"Type": "bind", "Source": "/r/pg.conf", "Destination": "/etc/pg.conf"}"#;
+        let wal = r#"{"Type": "bind", "Source": "/r/wal", "Destination": "/var/lib/postgresql/data/pg_wal"}"#;
+
+        let ok = container_with(&format!("[{data}, {conf}]"), "[]");
+        assert!(check_self_contained(Kind::Postgres, &ok, dir).is_ok());
+
+        let nested = container_with(&format!("[{data}, {wal}]"), "[]");
+        assert!(check_self_contained(Kind::Postgres, &nested, dir).is_err());
+
+        let waldir = container_with(&format!("[{data}]"), r#"["POSTGRES_INITDB_WALDIR=/pgwal"]"#);
+        assert!(check_self_contained(Kind::Postgres, &waldir, dir).is_err());
+        // The variable means nothing to other images.
+        assert!(check_self_contained(Kind::Mysql, &waldir, dir).is_ok());
     }
 }
