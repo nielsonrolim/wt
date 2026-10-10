@@ -66,6 +66,11 @@ pub fn run(branch: &str, base: Option<&str>) -> Result<()> {
 
 fn create_worktree(main: &Path, env: &Env, branch: &str, base: Option<&str>) -> Result<()> {
     let path = &env.path;
+    if let Some(base) = base
+        && git::branch_exists(main, branch)
+    {
+        eprintln!("warning: {branch} already exists, so --base {base} is ignored");
+    }
     if let Some(existing) = git::list(main)?.into_iter().find(|e| &e.path == path) {
         // Another branch can share the slug (feat/x and feat-x); reusing its
         // checkout would hand this branch the other one's databases.

@@ -34,7 +34,7 @@ wt down feat-x                     # remove containers, volumes e checkout; o br
 
 ### `wt up <branch> [--base REF]`
 
-Roda do checkout principal. Um branch existente é feito checkout; um desconhecido é criado a partir de `--base` (padrão `HEAD`). Rodar de novo é seguro: reaproveita a worktree, as portas e os volumes já clonados, e preserva o que você editou no `.env` da worktree.
+Roda do checkout principal. Um branch existente é feito checkout; um desconhecido é criado a partir de `--base` (padrão `HEAD`). Para um branch que já existe, `--base` é ignorado com um aviso. Rodar de novo é seguro: reaproveita a worktree, as portas e os volumes já clonados, e preserva o que você editou no `.env` da worktree.
 
 Passos, nesta ordem:
 
@@ -116,7 +116,7 @@ after_services = []         # depois que os serviços estão prontos
 
 A chave de `[services.<tipo>]` é o próprio tipo: `postgres`, `mysql`, `redis` ou `sqlite`. Qualquer outra é erro, e cada app tem no máximo um serviço de cada tipo. Uma tabela vazia, como `[services.postgres]`, basta quando o compose segue o padrão.
 
-O clone não repete nada do compose no config: imagem, comando, variáveis de ambiente, usuário, porta interna e diretório de dados são lidos do container de origem com `docker inspect`, então o clone sempre sobe exatamente como a origem. O volume de dados é o montado no diretório de dados padrão do tipo; se não houver, o único volume do container; se houver mais de um e nenhum no lugar padrão, use `volume`. Dados num bind mount não são suportados. Quando a origem publica várias portas (3306 e 33060 do MySQL), o clone usa a porta padrão do tipo se ela estiver entre elas; senão, a menor porta TCP.
+O clone não repete nada do compose no config: imagem, entrypoint, comando, variáveis de ambiente, usuário, diretório de trabalho, porta interna e diretório de dados são lidos do container de origem com `docker inspect`, então o clone sempre sobe exatamente como a origem. O clone também recebe os bind mounts da origem (arquivos de config, scripts de init), sempre somente-leitura, e os mounts tmpfs. Os outros volumes nomeados e qualquer coisa montada dentro do diretório de dados ficam de fora, para o clone nunca escrever em estado que pertence à origem. O volume de dados é o montado no diretório de dados padrão do tipo; se não houver, o único volume do container; se houver mais de um e nenhum no lugar padrão, use `volume`. Dados num bind mount não são suportados. Quando a origem publica várias portas (3306 e 33060 do MySQL), o clone usa a porta padrão do tipo se ela estiver entre elas; senão, a menor porta TCP.
 
 | | Postgres | MySQL/MariaDB | Redis/Valkey | SQLite |
 |---|---|---|---|---|

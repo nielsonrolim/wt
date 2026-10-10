@@ -3,7 +3,7 @@ use anyhow::Result;
 use crate::cmd::known_slugs;
 use crate::config::Config;
 use crate::docker::{self, Container};
-use crate::project::{self, Env, LABEL_SERVICE};
+use crate::project::{self, Env, LABEL_PROJECT, LABEL_SERVICE, LABEL_SLUG};
 use crate::state::State;
 use crate::{git, services::Kind};
 
@@ -26,17 +26,30 @@ pub fn run() -> Result<()> {
     // from before the config dropped it.
     let mut kinds: Vec<Kind> = cfg.services.iter().map(|s| s.kind).collect();
 
+    // One query for the whole project, split by slug below.
+    let (all_containers, all_volumes) = if docker_ok {
+        let label = [(LABEL_PROJECT, cfg.project.clone())];
+        (
+            docker::containers_labelled(&label)?,
+            docker::volumes_labelled(&label)?,
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
     let mut rows = Vec::new();
     for slug in &slugs {
         let env = Env::new(&cfg, slug);
-        let (containers, volumes) = if docker_ok {
-            (
-                docker::containers_labelled(&env.labels())?,
-                docker::volumes_labelled(&env.labels())?,
-            )
-        } else {
-            (Vec::new(), Vec::new())
-        };
+        let containers: Vec<Container> = all_containers
+            .iter()
+            .filter(|c| c.label(LABEL_SLUG) == Some(slug.as_str()))
+            .cloned()
+            .collect();
+        let volumes: Vec<_> = all_volumes
+            .iter()
+            .filter(|v| v.label(LABEL_SLUG) == Some(slug.as_str()))
+            .cloned()
+            .collect();
         for c in &containers {
             if let Some(kind) = c.label(LABEL_SERVICE).and_then(Kind::from_name)
                 && !kinds.contains(&kind)

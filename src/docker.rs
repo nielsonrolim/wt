@@ -29,6 +29,8 @@ pub struct Container {
 pub struct ContainerConfig {
     pub image: String,
     #[serde(default)]
+    pub entrypoint: Option<Vec<String>>,
+    #[serde(default)]
     pub cmd: Option<Vec<String>>,
     #[serde(default)]
     pub env: Option<Vec<String>>,
@@ -36,6 +38,8 @@ pub struct ContainerConfig {
     pub labels: Option<HashMap<String, String>>,
     #[serde(default)]
     pub user: String,
+    #[serde(default)]
+    pub working_dir: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -51,6 +55,8 @@ pub struct Mount {
     pub kind: String,
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub source: String,
     pub destination: String,
 }
 

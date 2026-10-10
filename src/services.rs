@@ -317,18 +317,52 @@ pub fn start(svc: &Service, src: &Source, env: &Env, port: u16) -> Result<()> {
         "-v".into(),
         format!("{}:{}", env.volume(svc.kind), src.data_dir),
     ]);
+    args.extend(extra_mounts(src));
     for kv in src.container.env() {
         args.extend(["-e".into(), kv.clone()]);
     }
     if !config.user.is_empty() {
         args.extend(["--user".into(), config.user.clone()]);
     }
+    if !config.working_dir.is_empty() {
+        args.extend(["--workdir".into(), config.working_dir.clone()]);
+    }
+    // Inspect reports the effective entrypoint, so an empty one means the
+    // source cleared the image's and the clone must clear it too.
+    // `--entrypoint` takes one word; the rest of a multi-word entrypoint goes
+    // before the command, which is how docker joins them anyway.
+    let entrypoint = config.entrypoint.clone().unwrap_or_default();
+    let first = entrypoint.first().cloned().unwrap_or_default();
+    args.extend(["--entrypoint".into(), first]);
     args.push(config.image.clone());
+    args.extend(entrypoint.into_iter().skip(1));
     args.extend(config.cmd.clone().unwrap_or_default());
 
     docker::run(&args)?;
     println!("Created {name} ({}) on 127.0.0.1:{port}", config.image);
     Ok(())
+}
+
+/// The source's bind mounts (config files, init scripts), always read-only,
+/// and its tmpfs mounts. Other named volumes, and anything inside the data
+/// dir, are left out: the clone must never write into state the source owns,
+/// such as a bind-mounted WAL directory both servers would append to.
+fn extra_mounts(src: &Source) -> Vec<String> {
+    let inside_data = format!("{}/", src.data_dir.trim_end_matches('/'));
+    let mut args = Vec::new();
+    for m in &src.container.mounts {
+        if m.destination == src.data_dir || m.destination.starts_with(&inside_data) {
+            continue;
+        }
+        match m.kind.as_str() {
+            "bind" if !m.source.is_empty() => {
+                args.extend(["-v".into(), format!("{}:{}:ro", m.source, m.destination)]);
+            }
+            "tmpfs" => args.extend(["--tmpfs".into(), m.destination.clone()]),
+            _ => {}
+        }
+    }
+    args
 }
 
 /// Waits until the server answers, then proves the data survived the copy.
@@ -410,8 +444,12 @@ fn probe(svc: &Service, src: &Source, name: &str, probe: Probe) -> bool {
             );
             docker::exec_output(name, &["sh", "-c", &script]).is_some()
         }
+        // The reply decides, not the exit code: whether an error reply such as
+        // NOAUTH exits non-zero varies between client versions.
         Kind::Redis => {
-            let script = format!("redis-cli -p {port} ping 2>&1 || valkey-cli -p {port} ping 2>&1");
+            let script = format!(
+                "cli=redis-cli; command -v $cli >/dev/null || cli=valkey-cli; $cli -p {port} ping 2>&1 || true"
+            );
             docker::exec_output(name, &["sh", "-c", &script])
                 .is_some_and(|out| out.contains("PONG") || out.contains("NOAUTH"))
         }
@@ -461,5 +499,39 @@ mod tests {
         // Anything else, e.g. an image that prints a banner, is not "no".
         assert!(parse_marker("").is_err());
         assert!(parse_marker("Welcome\nno").is_err());
+    }
+
+    #[test]
+    fn clone_gets_read_only_binds_and_tmpfs_but_no_shared_state() {
+        let json = r#"[{"Name": "/x", "Config": {"Image": "postgres"}, "State": {"Running": true},
+            "Mounts": [
+                {"Type": "volume", "Name": "app_db", "Destination": "/var/lib/postgresql/data", "RW": true},
+                {"Type": "volume", "Name": "app_sock", "Destination": "/run/postgresql", "RW": true},
+                {"Type": "bind", "Source": "/repo/pg.conf", "Destination": "/etc/pg.conf", "RW": false},
+                {"Type": "bind", "Source": "/repo/logs", "Destination": "/logs", "RW": true},
+                {"Type": "bind", "Source": "/repo/wal", "Destination": "/var/lib/postgresql/data/pg_wal", "RW": true},
+                {"Type": "tmpfs", "Source": "", "Destination": "/tmp", "RW": true}
+            ],
+            "HostConfig": {"PortBindings": null}}]"#;
+        let container = serde_json::from_str::<Vec<Container>>(json)
+            .unwrap()
+            .remove(0);
+        let src = Source {
+            container,
+            volume: "app_db".into(),
+            data_dir: "/var/lib/postgresql/data".into(),
+            container_port: 5432,
+        };
+        assert_eq!(
+            extra_mounts(&src),
+            [
+                "-v",
+                "/repo/pg.conf:/etc/pg.conf:ro",
+                "-v",
+                "/repo/logs:/logs:ro",
+                "--tmpfs",
+                "/tmp"
+            ]
+        );
     }
 }

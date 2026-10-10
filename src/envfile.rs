@@ -1,7 +1,8 @@
 //! The worktree's `.env` and `.envrc`.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::process::Command;
 
@@ -59,10 +60,20 @@ fn defined_key(line: &str) -> Option<&str> {
 }
 
 /// 0600: the copy carries the same secrets as the main checkout's file.
+/// Created 0600 and narrowed before any byte lands, so the secrets are never
+/// readable by others, not even for a moment or on a file that existed.
 pub fn write_private(path: &Path, content: &str) -> Result<()> {
-    fs::write(path, content).with_context(|| format!("could not write {}", path.display()))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    Ok(())
+    let write = || -> std::io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        file.write_all(content.as_bytes())
+    };
+    write().with_context(|| format!("could not write {}", path.display()))
 }
 
 /// A child process cannot export into the shell that called it, so leave a
@@ -133,5 +144,19 @@ mod tests {
         assert_eq!(defined_key("# FOO=bar"), Some("FOO"));
         assert_eq!(defined_key("# a comment = with equals"), None);
         assert_eq!(defined_key("exporter=1"), Some("exporter"));
+    }
+
+    #[test]
+    fn write_private_narrows_an_existing_file() {
+        let dir = std::env::temp_dir().join(format!("wt-envfile-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".env");
+        fs::write(&path, "OLD=1\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        write_private(&path, "NEW=1\n").unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "NEW=1\n");
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
