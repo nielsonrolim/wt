@@ -2,7 +2,7 @@
 
 [English](README.md) · Português (Brasil)
 
-Uma git worktree com bancos e porta web próprios, para qualquer app. `wt up feat/x` cria a worktree, clona os bancos de desenvolvimento do checkout principal (Postgres, MySQL/MariaDB, Redis/Valkey, SQLite), sobe cada um numa porta livre e escreve o `.env` da worktree apontando para eles. `wt down` desfaz tudo e mantém o branch.
+Uma git worktree com bancos e porta web próprios, para qualquer app. `wt up feat/x` cria a worktree, clona os bancos de desenvolvimento do checkout principal (Postgres, MySQL/MariaDB, Redis/Valkey, SQLite), sobe cada um numa porta livre e escreve o `.env` da worktree apontando para eles. `wt down` desfaz tudo, perguntando sobre o branch e mantendo-o por padrão.
 
 ## Por que isso existe
 
@@ -27,7 +27,7 @@ wt up feat/x                       # worktree + bancos clonados + porta web
 cd ~/.herdr/worktrees/minha-app/feat-x && source .envrc
 bin/dev                            # ou o que a app usar; lê PORT e DB_PORT do ambiente/.env
 wt ls                              # lista as worktrees e o estado de cada uma
-wt down feat-x                     # remove containers, volumes e checkout; o branch fica
+wt down feat-x                     # remove containers, volumes e checkout; o branch fica, a menos que você peça
 ```
 
 ## Comandos
@@ -46,18 +46,21 @@ Passos, nesta ordem:
 6. Para cada serviço: clona o volume, sobe o container, espera ficar pronto e confere que os dados vieram.
 7. Roda `hooks.after_services`.
 
-### `wt down [slug] [--keep-checkout] [--yes] [--force]`
+### `wt down [slug] [--keep-checkout] [--delete-branch] [--yes] [--force]`
 
-Remove os containers e volumes da worktree, o checkout e o registro de portas. O branch nunca é apagado. Sem slug, usa a worktree em que você está (e pede para sair dela) ou mostra uma lista para escolher.
+Remove os containers e volumes da worktree, o checkout e o registro de portas. Na hora de tirar o checkout, pergunta se o branch também deve ser apagado, e o padrão é mantê-lo. Sem slug, usa a worktree em que você está (e pede para sair dela) ou mostra uma lista para escolher.
 
 Proteções:
 
 - Só remove recursos com as labels `wt.project` e `wt.slug` desta worktree. Um container ou volume que só tem o nome esperado é recusado, a menos que você passe `--force`.
 - Nunca remove um container de origem nem um volume montado nele.
 - Recusa um checkout com mudanças não commitadas (`--force` passa por cima).
-- Pede confirmação. Sem terminal, exige `--yes` (ou `WT_YES=1`).
+- Pede confirmação e, depois, sobre o branch. Sem terminal, exige `--yes` (ou `WT_YES=1`), que responde tudo com o padrão: mantém o branch.
+- Só oferece o branch quando o checkout desta worktree vai embora, e o apaga depois que o checkout sumiu. Um branch ainda em checkout em outro lugar — o principal incluído — nunca é tocado.
 
-`--keep-checkout` remove só os containers e volumes; a worktree e a porta web ficam.
+`--keep-checkout` remove só os containers e volumes; a worktree e a porta web ficam, então não há branch sobre o que perguntar.
+
+`--delete-branch` pula a pergunta e apaga o branch depois que o checkout sumiu, perdendo commits que nunca foram mergeados em lugar nenhum. Não dá para combinar com `--keep-checkout`.
 
 ### `wt ls`
 
@@ -224,7 +227,7 @@ As portas ficam fora do checkout para não aparecerem no `git status`. Esse arqu
 | `WT_CONFIG` | caminho explícito do `.wt.toml` |
 | `WT_NO_HERDR=1` | usa `git worktree` mesmo com o Herdr disponível |
 | `WT_TRUST_REPOSITORY=1` | passa `--trust-repository` ao `herdr worktree create` |
-| `WT_YES=1` | `wt down` sem confirmação |
+| `WT_YES=1` | `wt down` sem confirmação; o branch é mantido |
 | `XDG_CONFIG_HOME`, `XDG_STATE_HOME` | onde ficam o config fora do repo e o registro de portas |
 
 ## Desenvolvimento

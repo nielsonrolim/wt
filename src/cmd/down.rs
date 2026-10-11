@@ -15,6 +15,7 @@ use crate::{git, herdr};
 
 pub struct Options {
     pub keep_checkout: bool,
+    pub delete_branch: bool,
     pub yes: bool,
     pub force: bool,
 }
@@ -55,10 +56,24 @@ pub fn run(slug_arg: Option<&str>, opts: Options) -> Result<()> {
     if has_checkout && !opts.keep_checkout {
         check_dirty(&env, opts.force)?;
     }
+    if opts.delete_branch && opts.keep_checkout {
+        bail!("--delete-branch and --keep-checkout contradict each other");
+    }
     confirm(&slug, &opts)?;
 
-    // Read before the checkout goes away, so the closing line can name it.
+    // Read before the checkout goes away, so the closing line can name it, and
+    // decide while it is still there whether the branch is ours to delete.
     let branch = git::current_branch(&env.path);
+    let deletable = branch
+        .as_deref()
+        .filter(|b| !opts.keep_checkout && is_deletable(&main, &env, b));
+    if opts.delete_branch && deletable.is_none() {
+        eprintln!("No branch to delete for {slug}.");
+    }
+    let delete_branch = match deletable {
+        Some(branch) => confirm_branch_delete(branch, &opts)?,
+        None => false,
+    };
 
     for name in &target.containers {
         docker::remove_container(name)?;
@@ -78,8 +93,13 @@ pub fn run(slug_arg: Option<&str>, opts: Options) -> Result<()> {
         State::remove(&env.project, &env.slug);
     }
 
-    if let Some(branch) = branch {
-        println!("Branch {branch} was kept.");
+    if let Some(branch) = &branch {
+        if delete_branch {
+            git::delete_branch(&main, branch)?;
+            println!("Deleted branch {branch}.");
+        } else {
+            println!("Branch {branch} was kept.");
+        }
     }
     Ok(())
 }
@@ -243,6 +263,15 @@ fn describe(env: &Env, target: &Target) {
     }
 }
 
+/// Whether `git branch -D` may take this branch once its checkout is gone: it
+/// exists, HEAD is not detached, and no other worktree — the main checkout
+/// included — has it checked out.
+fn is_deletable(main: &Path, env: &Env, branch: &str) -> bool {
+    branch != "HEAD"
+        && git::branch_exists(main, branch)
+        && matches!(git::holder_of(main, branch), Ok(Some(holder)) if project::canon(&holder) == env.path)
+}
+
 fn check_dirty(env: &Env, force: bool) -> Result<()> {
     let dirty = git::dirty(&env.path);
     if dirty.trim().is_empty() {
@@ -261,23 +290,44 @@ fn check_dirty(env: &Env, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// `--yes` and `WT_YES=1` answer every prompt with its default.
+fn assumed_yes(opts: &Options) -> bool {
+    opts.yes || env::var("WT_YES").as_deref() == Ok("1")
+}
+
 fn confirm(slug: &str, opts: &Options) -> Result<()> {
-    if opts.yes || env::var("WT_YES").as_deref() == Ok("1") {
+    if assumed_yes(opts) {
         return Ok(());
     }
     if !std::io::stdin().is_terminal() {
         bail!("refusing to destroy {slug} without a terminal; pass --yes");
     }
     let ok = dialoguer::Confirm::new()
-        .with_prompt(format!(
-            "Destroy the {slug} environment? The branch is kept."
-        ))
+        .with_prompt(format!("Destroy the {slug} environment?"))
         .default(false)
         .interact_opt()?;
     if ok != Some(true) {
         bail!("cancelled");
     }
     Ok(())
+}
+
+/// Asked only once the checkout is on its way out. The default is to keep the
+/// branch, and only `--delete-branch` asks for it without a prompt.
+fn confirm_branch_delete(branch: &str, opts: &Options) -> Result<bool> {
+    if opts.delete_branch {
+        return Ok(true);
+    }
+    if assumed_yes(opts) {
+        return Ok(false);
+    }
+    let ok = dialoguer::Confirm::new()
+        .with_prompt(format!(
+            "Also delete branch {branch}? Commits it has not merged anywhere are lost."
+        ))
+        .default(false)
+        .interact_opt()?;
+    Ok(ok == Some(true))
 }
 
 fn remove_checkout(main: &Path, env: &Env, force: bool) -> Result<()> {

@@ -228,16 +228,23 @@ step "wt down feat-y --keep-checkout"
 [ -z "$(docker ps -aq --filter "label=wt.slug=feat-y")" ] || fail "keep-checkout left containers"
 [ -z "$(docker volume ls -q --filter "label=wt.slug=feat-y")" ] || fail "keep-checkout left volumes"
 grep -q '^app_port' "$XDG_STATE_HOME/wt/$PROJECT/feat-y.toml" || fail "keep-checkout dropped the web port"
+git show-ref --verify --quiet refs/heads/feat/y || fail "keep-checkout went after the branch"
+
+step "wt down refuses --keep-checkout with --delete-branch"
+rm -f "$WORK/root/feat-y"/hook-*.out
+"$WT" down feat-y --keep-checkout --delete-branch --yes 2>"$WORK/clash.log" && fail "down accepted contradictory flags"
+grep -q 'contradict each other' "$WORK/clash.log" || fail "wrong error for contradictory flags"
+[ -d "$WORK/root/feat-y" ] || fail "the refused run removed the checkout"
 
 step "wt down feat-x"
-rm -f "$WORK/root/feat-y"/hook-*.out
 "$WT" down feat-x --yes
-"$WT" down feat-y --yes >/dev/null
+"$WT" down feat-y --yes --delete-branch >/dev/null
 [ -z "$(docker ps -aq --filter "label=wt.project=$PROJECT")" ] || fail "containers left"
 [ -z "$(docker volume ls -q --filter "label=wt.project=$PROJECT")" ] || fail "volumes left"
 [ ! -e "$WTP" ] || fail "checkout left"
 [ ! -e "$XDG_STATE_HOME/wt/$PROJECT/feat-x.toml" ] || fail "state left"
-git show-ref --verify --quiet refs/heads/feat/x || fail "branch deleted"
+git show-ref --verify --quiet refs/heads/feat/x || fail "branch deleted without --delete-branch"
+git show-ref --verify --quiet refs/heads/feat/y && fail "--delete-branch kept the branch"
 docker volume inspect "${PROJECT}_pg-data" >/dev/null || fail "source volume touched"
 "$WT" ls | grep -q 'No worktree environments' || fail "ls not empty"
 

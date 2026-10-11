@@ -11,6 +11,7 @@ A CLI that gives each git worktree its own byte-copied development databases and
 - **Service keys are the four types.** `[services.postgres|mysql|redis|sqlite]`, at most one of each, with no `type` field. `deny_unknown_fields` turns any other key into an error.
 - **State lives outside the checkout.** Ports go in `$XDG_STATE_HOME/wt/<project>/<slug>.toml`, so `git status` stays clean, and those files are the cross-project registry `ports::find_free` checks.
 - **Re-runs are idempotent.** The published port wins, then the state file, then a free port. The `.env` rewrite reproduces itself, and copies never overwrite.
+- **The branch outlives the worktree by default.** `down` asks about it and keeps it; only `--delete-branch` answers yes without a prompt, and `--yes`/`WT_YES=1` means the defaults.
 
 ## Adding a container adapter
 

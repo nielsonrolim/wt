@@ -36,15 +36,19 @@ enum Command {
         #[arg(long, value_name = "REF")]
         base: Option<String>,
     },
-    /// Remove a worktree's containers, volumes and checkout; the branch is kept
+    /// Remove a worktree's containers, volumes and checkout
     ///
-    /// Without a slug, uses the worktree you are standing in, or asks.
+    /// The branch is kept unless you ask for it, and without a slug it uses the
+    /// worktree you are standing in, or asks.
     Down {
         slug: Option<String>,
         /// Remove only the containers and volumes
         #[arg(long)]
         keep_checkout: bool,
-        /// Skip the confirmation prompt
+        /// Also delete the branch, once the checkout is gone
+        #[arg(long)]
+        delete_branch: bool,
+        /// Skip the confirmation prompts
         #[arg(long)]
         yes: bool,
         /// Also proceed on a dirty checkout or unlabelled resources
@@ -80,12 +84,14 @@ fn main() -> ExitCode {
         Command::Down {
             slug,
             keep_checkout,
+            delete_branch,
             yes,
             force,
         } => cmd::down::run(
             slug.as_deref(),
             cmd::down::Options {
                 keep_checkout,
+                delete_branch,
                 yes,
                 force,
             },

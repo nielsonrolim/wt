@@ -100,6 +100,12 @@ pub fn remove(main: &Path, path: &Path, force: bool) -> Result<()> {
     sh::output(cmd.arg(path)).map(drop)
 }
 
+/// Force-deletes a local branch. `wt down` only gets here after an explicit
+/// yes, so the unmerged check `-d` would run is not what the caller asked for.
+pub fn delete_branch(main: &Path, branch: &str) -> Result<()> {
+    sh::output(git(main).args(["branch", "-D", branch])).map(drop)
+}
+
 /// Clears registrations whose directory was deleted by hand.
 pub fn prune(main: &Path) -> Result<()> {
     sh::output(git(main).args(["worktree", "prune"])).map(drop)
