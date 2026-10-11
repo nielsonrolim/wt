@@ -24,7 +24,7 @@ A CLI that gives each git worktree its own byte-copied development databases and
 cargo fmt
 cargo clippy --all-targets -- -D warnings
 cargo test
-tests/e2e.sh          # full cycle; needs Docker and the postgres:16.7-alpine and redis:7-alpine images
+tests/e2e.sh          # full cycle; needs Docker and the postgres:16.7-alpine, mariadb:11 and redis:7-alpine images
 ```
 
 `tests/e2e.sh` builds its own compose project (`wte2e`) in a temp dir and cleans it up. Run `wt up` only against that disposable stack: on a real stack, it stops the developer's database during the copy.

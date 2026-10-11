@@ -232,7 +232,7 @@ As portas ficam fora do checkout para não aparecerem no `git status`. Esse arqu
 ```bash
 cargo test                          # testes unitários
 cargo clippy --all-targets -- -D warnings
-tests/e2e.sh                        # ciclo completo contra um compose descartável (Postgres + Redis + SQLite)
+tests/e2e.sh                        # ciclo completo contra um compose descartável (Postgres + MySQL + Redis + SQLite)
 ```
 
 ## Licença

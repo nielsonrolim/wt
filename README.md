@@ -240,7 +240,7 @@ Ports live outside the checkout so they never show up in `git status`. A re-run 
 ```bash
 cargo test                          # unit tests
 cargo clippy --all-targets -- -D warnings
-tests/e2e.sh                        # full cycle against a throwaway compose stack (Postgres + Redis + SQLite)
+tests/e2e.sh                        # full cycle against a throwaway compose stack (Postgres + MySQL + Redis + SQLite)
 ```
 
 ## License
