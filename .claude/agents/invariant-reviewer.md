@@ -20,7 +20,7 @@ You review changes to `wt` for one thing: whether they break an invariant in `AG
 
 **Labels prove ownership.** Every `create_volume` call and every `docker run`/`create` that makes a container passes `env.labels()` plus `(LABEL_SERVICE, kind)`. In `cmd/down.rs`, every removal is gated on `wt.project` and `wt.slug` matching; a name match without that gate is allowed only behind `--force`. The guards after it (the `env.prefix()` namespace check and the exclusion of the configured sources and their volumes) stay intact even under `--force`.
 
-**Clone boots from the source's config.** Image, cmd, env, user, container port and data dir in `services::start` and `resolve_source` come from the inspected `Container`. A new field in `config.rs` that duplicates one of those is a violation.
+**Clone boots from the source's config.** Image, cmd, env, user, container port, data dir, shm size and ulimits in `services::start` and `resolve_source` come from the inspected `Container`. A new field in `config.rs` that duplicates one of those is a violation.
 
 **Hooks are argv.** `hooks::run` builds `Command::new(&argv[0]).args(&argv[1..])`. Wrapping a hook in `sh -c`, or rebuilding its argv by splitting a string, is a violation; `argv.join(" ")` for the printed line and error context is fine. (`sh -c` inside `docker::exec_output` probes and `run_shell` copy scripts runs inside the container and is fine.)
 

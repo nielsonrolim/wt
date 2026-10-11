@@ -115,13 +115,24 @@ fn create_worktree(main: &Path, env: &Env, branch: &str, base: Option<&str>) -> 
 fn resolve_ports(cfg: &Config, env: &Env) -> Result<State> {
     let previous = State::load(&env.project, &env.slug);
     let mut claimed: HashSet<u16> = state::claimed_ports();
-    if !cfg.services.is_empty() {
-        claimed.extend(docker::claimed_host_ports()?);
+    // Every container's published ports, stopped ones included, so a re-run
+    // never hands out a port a stopped clone still owns. Without services
+    // Docker may not be installed at all, and a failure here is not fatal.
+    match docker::claimed_host_ports() {
+        Ok(ports) => claimed.extend(ports),
+        Err(e) => {
+            if !cfg.services.is_empty() {
+                return Err(e);
+            }
+        }
     }
 
     let mut next = State::default();
     if !cfg.app.port_env.is_empty() {
-        let port = match previous.app_port {
+        let port = match previous
+            .app_port
+            .filter(|p| in_range(*p, cfg.app.port_range))
+        {
             Some(p) => p,
             None => ports::find_free(cfg.app.port_range, &claimed)?,
         };
@@ -131,9 +142,17 @@ fn resolve_ports(cfg: &Config, env: &Env) -> Result<State> {
 
     for svc in &cfg.services {
         let name = svc.kind.name();
+        // The published port wins even if it is now outside the configured
+        // range: the container already bound it. The state file only counts
+        // while it still sits in the range.
         let published = docker::container(&env.container(svc.kind))
             .and_then(|c| c.host_ports().first().copied());
-        let port = match published.or(previous.ports.get(name).copied()) {
+        let recorded = previous
+            .ports
+            .get(name)
+            .copied()
+            .filter(|p| in_range(*p, svc.port_range));
+        let port = match published.or(recorded) {
             Some(p) => p,
             None => ports::find_free(svc.port_range, &claimed)?,
         };
@@ -143,18 +162,31 @@ fn resolve_ports(cfg: &Config, env: &Env) -> Result<State> {
     Ok(next)
 }
 
+fn in_range(port: u16, (first, last): (u16, u16)) -> bool {
+    (first..=last).contains(&port)
+}
+
 fn env_values(cfg: &Config, state: &State) -> Vec<(String, String)> {
     let mut values = Vec::new();
     for svc in &cfg.services {
         let port = state.ports[svc.kind.name()].to_string();
         for (k, v) in &svc.env {
-            values.push((k.clone(), v.replace("{port}", &port)));
+            set_value(&mut values, k.clone(), v.replace("{port}", &port));
         }
     }
     if let Some(port) = state.app_port {
-        values.push((cfg.app.port_env.clone(), port.to_string()));
+        set_value(&mut values, cfg.app.port_env.clone(), port.to_string());
     }
     values
+}
+
+/// One entry per key. A key a later service — or the web port — defines again
+/// replaces the earlier value instead of appending a duplicate line to `.env`.
+fn set_value(values: &mut Vec<(String, String)>, key: String, value: String) {
+    match values.iter_mut().find(|(k, _)| k == &key) {
+        Some((_, v)) => *v = value,
+        None => values.push((key, value)),
+    }
 }
 
 /// Rewrites the worktree's own file on re-runs, so hand edits survive.
@@ -247,4 +279,33 @@ fn report(cfg: &Config, env: &Env, branch: &str, state: &State) {
         "  wt down {}   # removes the services and the checkout; keeps the branch",
         env.slug
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn in_range_is_inclusive() {
+        assert!(in_range(5433, (5433, 5499)));
+        assert!(in_range(5499, (5433, 5499)));
+        assert!(!in_range(5432, (5433, 5499)));
+        assert!(!in_range(5500, (5433, 5499)));
+    }
+
+    #[test]
+    fn set_value_keeps_one_entry_per_key() {
+        let mut values = Vec::new();
+        set_value(&mut values, "DB_PORT".into(), "5433".into());
+        set_value(&mut values, "PORT".into(), "3001".into());
+        // A later service redefining the key replaces the value, not appends.
+        set_value(&mut values, "DB_PORT".into(), "5434".into());
+        assert_eq!(
+            values,
+            vec![
+                ("DB_PORT".to_string(), "5434".to_string()),
+                ("PORT".to_string(), "3001".to_string()),
+            ]
+        );
+    }
 }

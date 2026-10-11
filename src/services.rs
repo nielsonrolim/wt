@@ -3,6 +3,7 @@
 //! source's own image, command and env.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -45,7 +46,9 @@ impl Kind {
         match repo.as_str() {
             "postgres" | "postgis" | "pgvector" | "timescaledb" => Some(Kind::Postgres),
             "mysql" | "mariadb" | "percona" => Some(Kind::Mysql),
-            "redis" | "valkey" | "keydb" | "redis-stack-server" => Some(Kind::Redis),
+            "redis" | "valkey" | "keydb" | "redis-stack" | "redis-stack-server" => {
+                Some(Kind::Redis)
+            }
             _ => None,
         }
     }
@@ -197,6 +200,9 @@ fn check_self_contained(kind: Kind, container: &Container, data_dir: &str) -> Re
         && let Some(dir) = container
             .env_value("POSTGRES_INITDB_WALDIR")
             .filter(|d| !d.is_empty())
+        // A WAL dir inside the data volume is copied along with it. One moved
+        // by other means (a `-c` flag, a config file) is not detected here.
+        && !Path::new(dir).starts_with(data_dir)
     {
         bail!(
             "{source} keeps its WAL in {dir}, outside the data volume; wt copies only the data volume, so the clone would boot without it (set clone = false to start empty)"
@@ -289,7 +295,10 @@ pub fn prepare_volume(svc: &Service, src: &Source, env: &Env) -> Result<()> {
         println!("Stopping {source} (it is down for the few seconds of the copy)");
         // Registered before the stop: a Ctrl-C while `docker stop` waits still
         // lets the daemon finish stopping it, and the handler must restart it.
-        STOPPED.lock().expect("lock").push(source.clone());
+        match STOPPED.lock() {
+            Ok(mut v) => v.push(source.clone()),
+            Err(poisoned) => poisoned.into_inner().push(source.clone()),
+        }
         docker::stop(&source)?;
     }
 
@@ -330,8 +339,10 @@ pub fn start(svc: &Service, src: &Source, env: &Env, port: u16) -> Result<()> {
         }
         if !existing.state.running {
             docker::start(&name)?;
+            println!("Started {name}");
+        } else {
+            println!("Reusing {name}");
         }
-        println!("Started {name}");
         return Ok(());
     }
 
@@ -351,6 +362,7 @@ pub fn start(svc: &Service, src: &Source, env: &Env, port: u16) -> Result<()> {
         format!("{}:{}", env.volume(svc.kind), src.data_dir),
     ]);
     args.extend(extra_mounts(src));
+    args.extend(resource_args(&src.container));
     for kv in src.container.env() {
         args.extend(["-e".into(), kv.clone()]);
     }
@@ -394,6 +406,24 @@ fn extra_mounts(src: &Source) -> Vec<String> {
             "tmpfs" => args.extend(["--tmpfs".into(), m.destination.clone()]),
             _ => {}
         }
+    }
+    args
+}
+
+/// The source's `HostConfig` values that change how the container runs and are
+/// not in the image or command: its shared-memory size and ulimits. Without
+/// them the clone falls back to the daemon defaults, which for Postgres means
+/// 64 MiB of `/dev/shm` and parallel queries that fail under load.
+fn resource_args(container: &Container) -> Vec<String> {
+    let mut args = Vec::new();
+    if container.shm_size() > 0 {
+        args.extend(["--shm-size".into(), container.shm_size().to_string()]);
+    }
+    for u in container.ulimits() {
+        args.extend([
+            "--ulimit".into(),
+            format!("{}={}:{}", u.name, u.soft, u.hard),
+        ]);
     }
     args
 }
@@ -512,6 +542,10 @@ mod tests {
             Some(Kind::Redis)
         );
         assert_eq!(Kind::from_image("redis@sha256:abc"), Some(Kind::Redis));
+        assert_eq!(
+            Kind::from_image("redis/redis-stack:latest"),
+            Some(Kind::Redis)
+        );
         assert_eq!(Kind::from_image("localstack/localstack:4"), None);
     }
 
@@ -568,6 +602,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn clone_gets_the_source_shm_size_and_ulimits() {
+        let json = r#"[{"Name": "/x", "Config": {"Image": "postgres"}, "State": {"Running": true},
+            "Mounts": [], "HostConfig": {"ShmSize": 1073741824,
+            "Ulimits": [{"Name": "nofile", "Soft": 1024, "Hard": 65536},
+                        {"Name": "nproc", "Soft": 2048, "Hard": 4096}]}}]"#;
+        let container = serde_json::from_str::<Vec<Container>>(json)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            resource_args(&container),
+            [
+                "--shm-size",
+                "1073741824",
+                "--ulimit",
+                "nofile=1024:65536",
+                "--ulimit",
+                "nproc=2048:4096"
+            ]
+        );
+        // A source that sets neither adds nothing.
+        assert!(resource_args(&container_with("[]", "[]")).is_empty());
+    }
+
     fn container_with(mounts: &str, env: &str) -> Container {
         let json = format!(
             r#"[{{"Name": "/db", "Config": {{"Image": "postgres", "Env": {env}}},
@@ -593,6 +651,12 @@ mod tests {
 
         let waldir = container_with(&format!("[{data}]"), r#"["POSTGRES_INITDB_WALDIR=/pgwal"]"#);
         assert!(check_self_contained(Kind::Postgres, &waldir, dir).is_err());
+        // A WAL dir inside the data volume travels with the copy, so it is fine.
+        let inside = container_with(
+            &format!("[{data}]"),
+            r#"["POSTGRES_INITDB_WALDIR=/var/lib/postgresql/data/wal"]"#,
+        );
+        assert!(check_self_contained(Kind::Postgres, &inside, dir).is_ok());
         // The variable means nothing to other images.
         assert!(check_self_contained(Kind::Mysql, &waldir, dir).is_ok());
     }

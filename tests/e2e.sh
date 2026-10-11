@@ -143,10 +143,30 @@ step "a branch with the same slug is refused"
 "$WT" up feat-x 2>/dev/null && fail "feat-x reused feat/x's worktree"
 [ "$(git -C "$WTP" rev-parse --abbrev-ref HEAD)" = feat/x ] || fail "feat/x checkout changed"
 
-step "second worktree gets different ports"
+step "second worktree: different ports, and clone = false starts empty"
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[app]
+copy = ["storage"]
+
+[services.postgres]
+database = "app"
+
+[services.redis]
+clone = false
+
+[services.sqlite]
+files = ["storage/development.sqlite3"]
+
+[hooks]
+setup = [["sh", "-c", "echo setup \$WT_SLUG > hook-setup.out"]]
+after_services = [["sh", "-c", "echo \$WT_POSTGRES_PORT \$WT_REDIS_PORT \$WT_APP_PORT > hook-after.out"]]
+EOF
 "$WT" up feat/y >/dev/null
 [ "$(sed -n 's/^DB_PORT=//p' "$WORK/root/feat-y/.env")" != "$PG_PORT" ] || fail "pg port reused"
 [ "$(sed -n 's/^PORT=//p' "$WORK/root/feat-y/.env")" != "$APP_PORT" ] || fail "app port reused"
+[ -z "$(docker exec "$PROJECT-wt-feat-y-redis" redis-cli get marker)" ] || fail "clone=false copied redis data"
 
 step "wt ls"
 "$WT" ls | tee "$WORK/ls.log"
@@ -166,6 +186,13 @@ docker volume rm "$PROJECT-wt-intruder-postgres-data" >/dev/null
 
 step "wt down from inside is refused"
 (cd "$WTP" && "$WT" down --yes 2>/dev/null) && fail "down ran from inside"
+
+step "wt down feat-y --keep-checkout"
+"$WT" down feat-y --keep-checkout --yes
+[ -d "$WORK/root/feat-y" ] || fail "keep-checkout removed the checkout"
+[ -z "$(docker ps -aq --filter "label=wt.slug=feat-y")" ] || fail "keep-checkout left containers"
+[ -z "$(docker volume ls -q --filter "label=wt.slug=feat-y")" ] || fail "keep-checkout left volumes"
+grep -q '^app_port' "$XDG_STATE_HOME/wt/$PROJECT/feat-y.toml" || fail "keep-checkout dropped the web port"
 
 step "wt down feat-x"
 rm -f "$WORK/root/feat-y"/hook-*.out

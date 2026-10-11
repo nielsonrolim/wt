@@ -148,7 +148,8 @@ fn find_target(cfg: &Config, env: &Env, force: bool) -> Result<Target> {
         {
             if !force && !labelled_for(c.label(LABEL_PROJECT), c.label(LABEL_SLUG), env) {
                 bail!(
-                    "{name} is not labelled {LABEL_SLUG}={}; pass --force if it is really yours",
+                    "{name} is not labelled {LABEL_PROJECT}={} and {LABEL_SLUG}={}; pass --force if it is really yours",
+                    env.project,
                     env.slug
                 );
             }
@@ -160,7 +161,8 @@ fn find_target(cfg: &Config, env: &Env, force: bool) -> Result<Target> {
         {
             if !force && !volume_labelled(&v, env) {
                 bail!(
-                    "{name} is not labelled {LABEL_SLUG}={}; pass --force if it is really yours",
+                    "{name} is not labelled {LABEL_PROJECT}={} and {LABEL_SLUG}={}; pass --force if it is really yours",
+                    env.project,
                     env.slug
                 );
             }

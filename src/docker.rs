@@ -65,6 +65,19 @@ pub struct Mount {
 pub struct HostConfig {
     #[serde(default)]
     pub port_bindings: Option<HashMap<String, Option<Vec<PortBinding>>>>,
+    /// Bytes; 0 when the source does not set it and the daemon default applies.
+    #[serde(default)]
+    pub shm_size: i64,
+    #[serde(default)]
+    pub ulimits: Option<Vec<Ulimit>>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "PascalCase")]
+pub struct Ulimit {
+    pub name: String,
+    pub soft: i64,
+    pub hard: i64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -130,6 +143,15 @@ impl Container {
 
     pub fn volume_mounts(&self) -> impl Iterator<Item = &Mount> {
         self.mounts.iter().filter(|m| m.kind == "volume")
+    }
+
+    /// Shared-memory size in bytes; 0 when the source leaves the default.
+    pub fn shm_size(&self) -> i64 {
+        self.host_config.shm_size
+    }
+
+    pub fn ulimits(&self) -> &[Ulimit] {
+        self.host_config.ulimits.as_deref().unwrap_or_default()
     }
 }
 
@@ -364,6 +386,21 @@ mod tests {
         serde_json::from_str::<Vec<Container>>(&json)
             .unwrap()
             .remove(0)
+    }
+
+    #[test]
+    fn parses_shm_size_and_ulimits() {
+        let json = r#"[{"Name": "/x", "Config": {"Image": "postgres"}, "State": {"Running": true},
+            "Mounts": [], "HostConfig": {"ShmSize": 1073741824,
+            "Ulimits": [{"Name": "nofile", "Soft": 1024, "Hard": 65536}]}}]"#;
+        let c: Vec<Container> = serde_json::from_str(json).unwrap();
+        assert_eq!(c[0].shm_size(), 1073741824);
+        assert_eq!(c[0].ulimits().len(), 1);
+        assert_eq!(c[0].ulimits()[0].name, "nofile");
+        // Absent fields stay at their defaults.
+        let c = with_bindings(r#"{"3306/tcp": [{"HostPort": "3306"}]}"#);
+        assert_eq!(c.shm_size(), 0);
+        assert!(c.ulimits().is_empty());
     }
 
     #[test]

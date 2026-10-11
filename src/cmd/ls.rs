@@ -117,14 +117,20 @@ fn status(cfg: &Config, env: &Env, containers: &[Container], has_volumes: bool) 
 }
 
 fn print_table(rows: &[Vec<String>]) {
+    // Widths in characters, not bytes, so a non-ASCII branch name still lines up.
     let widths: Vec<usize> = (0..rows[0].len())
-        .map(|i| rows.iter().map(|r| r[i].len()).max().unwrap_or(0))
+        .map(|i| rows.iter().map(|r| r[i].chars().count()).max().unwrap_or(0))
         .collect();
     for row in rows {
         let cells: Vec<String> = row
             .iter()
             .zip(&widths)
-            .map(|(cell, w)| format!("{cell:<w$}"))
+            .map(|(cell, w)| {
+                format!(
+                    "{cell}{}",
+                    " ".repeat(w.saturating_sub(cell.chars().count()))
+                )
+            })
             .collect();
         println!("{}", cells.join("  ").trim_end());
     }
