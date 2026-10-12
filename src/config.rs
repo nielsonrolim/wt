@@ -25,6 +25,8 @@ struct File {
     services: Services,
     #[serde(default)]
     hooks: Hooks,
+    #[serde(default)]
+    docker: Docker,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -36,6 +38,8 @@ pub struct App {
     pub env_file: String,
     pub envrc: bool,
     pub copy: Vec<String>,
+    /// Like `copy`, but replaced on every run when the main checkout differs.
+    pub refresh: Vec<String>,
 }
 
 impl Default for App {
@@ -46,6 +50,7 @@ impl Default for App {
             env_file: ".env".into(),
             envrc: true,
             copy: Vec::new(),
+            refresh: Vec::new(),
         }
     }
 }
@@ -70,6 +75,20 @@ struct ServiceFile {
     port_range: Option<(u16, u16)>,
     env: Option<BTreeMap<String, String>>,
     database: Option<String>,
+    check_sql: Option<String>,
+}
+
+/// How the clone's Docker resources are named and labelled, for repos that
+/// already have environments from another tool.
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields, default)]
+pub struct Docker {
+    /// Names the Postgres clone `<project>-wt-<slug>` and its volume
+    /// `<project>-wt-<slug>-db`, without the service in between.
+    pub legacy_names: bool,
+    /// An extra label, set to the slug on everything `up` creates. `down` and
+    /// `ls` also take it as proof of ownership.
+    pub slug_label: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -97,6 +116,8 @@ pub struct Service {
     /// Values may hold `{port}`, replaced with the clone's host port.
     pub env: BTreeMap<String, String>,
     pub database: Option<String>,
+    /// A query that must succeed on the clone before `up` calls it good.
+    pub check_sql: Option<String>,
 }
 
 #[derive(Debug)]
@@ -108,6 +129,7 @@ pub struct Config {
     pub services: Vec<Service>,
     pub sqlite: Option<Sqlite>,
     pub hooks: Hooks,
+    pub docker: Docker,
 }
 
 impl Config {
@@ -169,6 +191,18 @@ fn resolve(file: File, main_root: &Path, path: Option<PathBuf>) -> Result<Config
     };
 
     check_range("app.port_range", file.app.port_range)?;
+    // Nested counts too: refresh would overwrite inside a tree copy protects.
+    if let Some(path) = file.app.refresh.iter().find(|r| {
+        file.app
+            .copy
+            .iter()
+            .any(|c| Path::new(c).starts_with(r) || Path::new(r).starts_with(c))
+    }) {
+        bail!("app.copy and app.refresh both cover {path}; pick one");
+    }
+    if file.docker.slug_label.as_deref() == Some("") {
+        bail!("docker.slug_label must not be empty");
+    }
     for (phase, hooks) in [
         ("setup", &file.hooks.setup),
         ("after_services", &file.hooks.after_services),
@@ -191,6 +225,15 @@ fn resolve(file: File, main_root: &Path, path: Option<PathBuf>) -> Result<Config
                 kind.name()
             );
         }
+        if entry.check_sql.is_some() && kind != Kind::Postgres {
+            bail!(
+                "services.{}.check_sql is only supported for postgres",
+                kind.name()
+            );
+        }
+        if entry.check_sql.is_some() && entry.database.is_none() {
+            bail!("services.postgres.check_sql needs services.postgres.database");
+        }
         let port_range = entry.port_range.unwrap_or(kind.default_port_range());
         check_range(&format!("services.{}.port_range", kind.name()), port_range)?;
         services.push(Service {
@@ -203,6 +246,7 @@ fn resolve(file: File, main_root: &Path, path: Option<PathBuf>) -> Result<Config
             port_range,
             env: entry.env.unwrap_or_else(|| kind.default_env()),
             database: entry.database,
+            check_sql: entry.check_sql,
         });
     }
 
@@ -220,6 +264,7 @@ fn resolve(file: File, main_root: &Path, path: Option<PathBuf>) -> Result<Config
         services,
         sqlite: file.services.sqlite,
         hooks: file.hooks,
+        docker: file.docker,
     })
 }
 
@@ -376,6 +421,38 @@ mod tests {
         );
         assert_eq!(cfg.app.copy, vec!["storage"]);
         assert_eq!(cfg.hooks.after_services[0], vec!["bin/rails", "db:prepare"]);
+    }
+
+    #[test]
+    fn refresh_must_not_overlap_copy() {
+        let cfg = load("[app]\ncopy = [\"storage\"]\nrefresh = [\".claude/agents\"]").unwrap();
+        assert_eq!(cfg.app.refresh, vec![".claude/agents"]);
+        assert!(load("[app]\ncopy = [\"a\"]\nrefresh = [\"a\"]").is_err());
+        assert!(load("[app]\ncopy = [\"a\"]\nrefresh = [\"a/b\"]").is_err());
+        assert!(load("[app]\ncopy = [\"ab\"]\nrefresh = [\"a\"]").is_ok());
+    }
+
+    #[test]
+    fn check_sql_is_postgres_only_and_needs_a_database() {
+        let ok = "[services.postgres]\ndatabase = \"d\"\ncheck_sql = \"select 1\"";
+        assert_eq!(
+            load(ok).unwrap().service(Kind::Postgres).unwrap().check_sql,
+            Some("select 1".into())
+        );
+        assert!(load("[services.postgres]\ncheck_sql = \"select 1\"").is_err());
+        assert!(load("[services.mysql]\ncheck_sql = \"select 1\"").is_err());
+    }
+
+    #[test]
+    fn docker_table_defaults_and_rejects_unknown_keys() {
+        let cfg = load("").unwrap();
+        assert!(!cfg.docker.legacy_names);
+        assert!(cfg.docker.slug_label.is_none());
+        let cfg = load("[docker]\nlegacy_names = true\nslug_label = \"x.slug\"").unwrap();
+        assert!(cfg.docker.legacy_names);
+        assert_eq!(cfg.docker.slug_label.as_deref(), Some("x.slug"));
+        assert!(load("[docker]\nnaming = \"legacy\"").is_err());
+        assert!(load("[docker]\nslug_label = \"\"").is_err());
     }
 
     #[test]

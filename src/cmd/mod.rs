@@ -26,6 +26,20 @@ pub fn known_slugs(main: &Path, cfg: &Config) -> Result<Vec<String>> {
         for v in docker::volumes_labelled(&label)? {
             slugs.extend(v.label(LABEL_SLUG).map(String::from));
         }
+        // Environments another tool made carry only the configured slug label.
+        if let Some(key) = &cfg.docker.slug_label {
+            let prefix = format!("{}-wt-", cfg.project);
+            for c in docker::containers_with_label(key)? {
+                if c.name().starts_with(&prefix) {
+                    slugs.extend(c.label(key).map(String::from));
+                }
+            }
+            for v in docker::volumes_with_label(key)? {
+                if v.name.starts_with(&prefix) {
+                    slugs.extend(v.label(key).map(String::from));
+                }
+            }
+        }
     }
 
     let root = project::canon(&cfg.root);

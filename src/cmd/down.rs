@@ -7,7 +7,7 @@ use anyhow::{Result, bail};
 
 use crate::cmd::known_slugs;
 use crate::config::Config;
-use crate::docker::{self, Volume};
+use crate::docker;
 use crate::project::{self, Env, LABEL_PROJECT, LABEL_SLUG};
 use crate::services::Kind;
 use crate::state::State;
@@ -160,17 +160,28 @@ fn find_target(cfg: &Config, env: &Env, force: bool) -> Result<Target> {
         .into_iter()
         .map(|v| v.name)
         .collect();
+    if let Some(filter) = env.slug_filter() {
+        containers.extend(
+            docker::containers_labelled(&filter)?
+                .iter()
+                .map(|c| c.name().to_string()),
+        );
+        volumes.extend(
+            docker::volumes_labelled(&filter)?
+                .into_iter()
+                .map(|v| v.name),
+        );
+    }
 
     for kind in Kind::ALL {
         let name = env.container(kind);
         if !containers.contains(&name)
             && let Some(c) = docker::container(&name)
         {
-            if !force && !labelled_for(c.label(LABEL_PROJECT), c.label(LABEL_SLUG), env) {
+            if !force && !env.owns(|k| c.label(k)) {
                 bail!(
-                    "{name} is not labelled {LABEL_PROJECT}={} and {LABEL_SLUG}={}; pass --force if it is really yours",
-                    env.project,
-                    env.slug
+                    "{name} {}; pass --force if it is really yours",
+                    not_labelled(env)
                 );
             }
             containers.insert(name);
@@ -179,11 +190,10 @@ fn find_target(cfg: &Config, env: &Env, force: bool) -> Result<Target> {
         if !volumes.contains(&name)
             && let Some(v) = docker::volume(&name)
         {
-            if !force && !volume_labelled(&v, env) {
+            if !force && !env.owns(|k| v.label(k)) {
                 bail!(
-                    "{name} is not labelled {LABEL_PROJECT}={} and {LABEL_SLUG}={}; pass --force if it is really yours",
-                    env.project,
-                    env.slug
+                    "{name} {}; pass --force if it is really yours",
+                    not_labelled(env)
                 );
             }
             volumes.insert(name);
@@ -206,12 +216,15 @@ fn find_target(cfg: &Config, env: &Env, force: bool) -> Result<Target> {
     })
 }
 
-fn labelled_for(project: Option<&str>, slug: Option<&str>, env: &Env) -> bool {
-    project == Some(env.project.as_str()) && slug == Some(env.slug.as_str())
-}
-
-fn volume_labelled(v: &Volume, env: &Env) -> bool {
-    labelled_for(v.label(LABEL_PROJECT), v.label(LABEL_SLUG), env)
+fn not_labelled(env: &Env) -> String {
+    let mut text = format!(
+        "is not labelled {LABEL_PROJECT}={} and {LABEL_SLUG}={}",
+        env.project, env.slug
+    );
+    if let Some(key) = &env.slug_label {
+        text.push_str(&format!(" (or {key}={})", env.slug));
+    }
+    text
 }
 
 /// The main stack's containers and every volume they mount.

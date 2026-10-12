@@ -41,7 +41,7 @@ Steps, in order:
 1. Creates the worktree at `<root>/<slug>`, through Herdr if it is available and with `git worktree add` otherwise. The slug is the branch name lowercased, with every other character turned into `-`, up to 40 characters: `feat/ENG-12_x` → `feat-eng-12-x`. A branch whose slug is already taken by another branch's worktree (`feat/x` and `feat-x`) is refused.
 2. Picks the ports: the web port and one per service, each from its own range. It skips ports published by any container (stopped ones included), ports already given to another worktree of any project, and ports something is listening on.
 3. Writes the worktree's `.env`, copied from the main checkout the first time, and `.envrc`.
-4. Copies the SQLite files and the `app.copy` paths.
+4. Copies the SQLite files and the `app.copy` paths, and refreshes the `app.refresh` paths.
 5. Runs `hooks.setup`.
 6. For each service, clones the volume and starts the container. It then waits until the service is ready and checks that the data came across.
 7. Runs `hooks.after_services`.
@@ -52,7 +52,7 @@ Removes the worktree's containers and volumes, its checkout and its port record.
 
 Safeguards:
 
-- It removes only resources carrying this worktree's `wt.project` and `wt.slug` labels. It refuses a container or volume that merely has the expected name, unless you pass `--force`.
+- It removes only resources carrying this worktree's `wt.project` and `wt.slug` labels (or the `docker.slug_label` one, if configured). It refuses a container or volume that merely has the expected name, unless you pass `--force`.
 - It never removes a source container or a volume mounted in one.
 - It refuses a checkout with uncommitted changes; `--force` overrides this.
 - It asks for confirmation, then about the branch. Without a terminal, it requires `--yes` (or `WT_YES=1`). Both answer with the default: keep the branch.
@@ -105,7 +105,8 @@ port_env = "PORT"           # key that receives the web port; "" turns the web p
 port_range = [3001, 3099]
 env_file = ".env"           # copied from the main checkout the first time, then rewritten in place (0600)
 envrc = true                # writes an .envrc exporting the web port (skipped if the repo tracks one)
-copy = []                   # untracked paths copied from the main checkout
+copy = []                   # untracked paths copied from the main checkout, never overwritten
+refresh = []                # like copy, but replaced whenever the main checkout's file differs
 
 [services.postgres]         # the same options apply to [services.mysql] and [services.redis]
 source = "<project>-postgres-1"   # the source container; defaults to the name compose gives it
@@ -114,9 +115,14 @@ clone = true                      # false: empty volume, same image/command/env
 port_range = [5433, 5499]
 env = { DB_HOST = "127.0.0.1", DB_PORT = "{port}" }
 database = "postgres"             # postgres only: the database used to check the clone
+check_sql = "select 1"            # postgres only: the query that check runs; needs database
 
 [services.sqlite]
 files = []                  # required: files relative to the repo root
+
+[docker]
+legacy_names = false        # true: the Postgres clone is <project>-wt-<slug>, its volume <project>-wt-<slug>-db
+# slug_label = "myapp.worktree.slug"   # an extra label holding the slug; unset by default
 
 [hooks]
 setup = []                  # before the services
@@ -136,7 +142,7 @@ The config repeats nothing from compose. `wt` reads the image, entrypoint, comma
 | Port range | 5433–5499 | 3307–3399 | 6380–6449 | — |
 | Default `env` | `DB_HOST`, `DB_PORT` | `DB_HOST`, `DB_PORT` | `REDIS_URL=redis://127.0.0.1:{port}/0` | — |
 | Ready when | `pg_isready` over TCP | `mysqladmin ping` | `redis-cli ping` | — |
-| Check | `select 1` on `database` | ping | ping | — |
+| Check | `select 1` on `database`, or `check_sql` | ping | ping | — |
 
 In `env`, `{port}` becomes the clone's host port. The values use `127.0.0.1`, not `localhost`, because the clone publishes on IPv4 only and macOS resolves `localhost` to `::1` first.
 
@@ -144,13 +150,26 @@ The ranges don't overlap each other or the web port. Each sits above its databas
 
 ### The main database during the clone
 
-A byte-for-byte copy needs the database at rest, because a live data directory holds half-written pages. So `wt up` stops the source container (`docker stop`), copies the volume and starts it again. The source is down only for the seconds the copy takes, and comes back even if the copy fails or you press Ctrl-C. This happens only the first time, since re-runs reuse a cloned volume. A half-copied volume (one without the `.wt-clone-complete` marker) is discarded and copied again. If the marker check itself cannot run, `wt up` stops with an error and leaves the volume alone.
+A byte-for-byte copy needs the database at rest, because a live data directory holds half-written pages. So `wt up` stops the source container (`docker stop`), copies the volume and starts it again. The source is down only for the seconds the copy takes, and comes back even if the copy fails or you press Ctrl-C. This happens only the first time, since re-runs reuse a cloned volume. A half-copied volume (one with neither the `.wt-clone-complete` marker nor the `.worktree-clone-complete` one that `bin/worktree`-style scripts write) is discarded and copied again. If the marker check itself cannot run, `wt up` stops with an error and leaves the volume alone.
 
 SQLite stops nothing: `sqlite3 .backup` takes a consistent copy even while the app has the file open. Without the `sqlite3` CLI, `wt` copies the file along with its `-wal`/`-shm` files. Each file is copied only once; delete the worktree's copy to copy it again.
 
 ### `app.copy`
 
 Copies from the main checkout whatever the worktree doesn't have yet, and never overwrites. A file created or changed inside the worktree survives re-runs. On APFS the copy is a clonefile, so a large directory costs no disk space until something writes to it. The typical case is Active Storage blobs in `storage/`, which the cloned database points at.
+
+### `app.refresh`
+
+Like `app.copy`, but a file the main checkout has changed replaces the worktree's copy on every `wt up`. Use it for untracked files you edit in the main checkout and want every worktree to follow, such as git-ignored agent or skill definitions. A file only the worktree has is left alone, and an identical one is not touched. A path can't be in both `copy` and `refresh`.
+
+### `[docker]`
+
+For a repo that already has worktree environments made by another tool, so `wt` can take them over instead of starting a second database next to each.
+
+- `legacy_names = true` names the Postgres clone `<project>-wt-<slug>` and its volume `<project>-wt-<slug>-db`. MySQL and Redis keep the service in the name.
+- `slug_label` is an extra label that `up` sets to the slug on every container and volume. `down` and `ls` take it as proof of ownership alongside `wt.project` and `wt.slug`, so environments the other tool labelled with it show up in `ls` and can be torn down. The name must still sit in the `<project>-wt-` namespace.
+
+`wt up` on an existing environment reuses its container and volume, and its published port wins over the state file.
 
 ### Hooks
 
@@ -214,9 +233,11 @@ after_services = [["pnpm", "prisma", "migrate", "deploy"]]
 | What | Where |
 |---|---|
 | Worktree | `<root>/<slug>` (default `~/.herdr/worktrees/<project>/<slug>`) |
-| Containers | `<project>-wt-<slug>-<type>`, labelled `wt.project`, `wt.slug`, `wt.service` |
+| Containers | `<project>-wt-<slug>-<type>`, labelled `wt.project`, `wt.slug`, `wt.service` (and `slug_label`, if set) |
 | Volumes | `<project>-wt-<slug>-<type>-data`, with the same labels |
 | Ports | `~/.local/state/wt/<project>/<slug>.toml` (honours `XDG_STATE_HOME`) |
+
+With `docker.legacy_names`, Postgres is `<project>-wt-<slug>` and its volume `<project>-wt-<slug>-db`.
 
 Ports live outside the checkout so they never show up in `git status`. A re-run reuses the ports in that file. Because the file records every port handed out, two worktrees created while their servers are stopped never get the same web port.
 

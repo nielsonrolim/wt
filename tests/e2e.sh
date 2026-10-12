@@ -83,7 +83,7 @@ volumes:
   redis-data:
   z-nested-data:
 EOF
-printf '/.env*\n/storage/*\n!/storage/.keep\n' >.gitignore
+printf '/.env*\n/storage/*\n!/storage/.keep\n/agents/\n' >.gitignore
 touch storage/.keep
 printf 'SECRET=main\nDB_PORT=5432\n' >.env
 echo '{}' >package.json
@@ -95,6 +95,7 @@ docker compose exec -T redis sh -c 'redis-cli set marker cloned >/dev/null && re
 docker compose exec -T mariadb mariadb -uroot -papp app -e "create table marker(v text); insert into marker values ('cloned');" >/dev/null
 sqlite3 storage/development.sqlite3 "create table marker(v text); insert into marker values ('cloned');"
 mkdir -p storage/ab && echo blob >storage/ab/blob
+mkdir -p agents && echo v1 >agents/a.md
 
 step "wt init"
 "$WT" init
@@ -111,9 +112,11 @@ root = "$WORK/root"
 
 [app]
 copy = ["storage"]
+refresh = ["agents"]
 
 [services.postgres]
 database = "app"
+check_sql = "select count(*) from marker"
 
 [services.mysql]
 source = "$PROJECT-mariadb-1"
@@ -142,7 +145,7 @@ APP_PORT="$(sed -n 's/^PORT=//p' "$WTP/.env")"
 echo "ports: pg=$PG_PORT mysql=$MYSQL_PORT redis=$REDIS_URL app=$APP_PORT"
 [ "$(grep -c '^DB_PORT=' "$WTP/.env")" = 1 ] || fail "DB_PORT duplicated"
 grep -q '^SECRET=main$' "$WTP/.env" || fail ".env lost the main checkout's keys"
-[ "$(stat -f %Lp "$WTP/.env" 2>/dev/null || stat -c %a "$WTP/.env")" = 600 ] || fail ".env is not 0600"
+[ "$(stat -c %a "$WTP/.env" 2>/dev/null || stat -f %Lp "$WTP/.env")" = 600 ] || fail ".env is not 0600"
 grep -q "export PORT=$APP_PORT" "$WTP/.envrc" || fail ".envrc"
 [ -f "$XDG_STATE_HOME/wt/$PROJECT/feat-x.toml" ] || fail "no state file"
 
@@ -161,9 +164,18 @@ read -r hp hm hr ha <"$WTP/hook-after.out"
 [ "$hp" = "$PG_PORT" ] && [ "$hm" = "$MYSQL_PORT" ] && [ "$ha" = "$APP_PORT" ] && [ -n "$hr" ] || fail "after_services hook env"
 [ "$(docker inspect -f '{{.State.Running}}' "$PROJECT-postgres-1")" = true ] || fail "source not restarted"
 
+[ "$(cat "$WTP/agents/a.md")" = v1 ] || fail "refresh path not copied"
+
 step "wt up feat/x again (idempotent)"
 echo "LOCAL=1" >>"$WTP/.env"
+echo v2 >agents/a.md
+echo mine >"$WTP/agents/local.md"
+echo changed >"$WTP/storage/ab/blob"
 "$WT" up feat/x | tee "$WORK/rerun.log"
+[ "$(cat "$WTP/agents/a.md")" = v2 ] || fail "refresh did not follow the main checkout"
+[ "$(cat "$WTP/agents/local.md")" = mine ] || fail "refresh removed a worktree-only file"
+[ "$(cat "$WTP/storage/ab/blob")" = changed ] || fail "copy overwrote a worktree edit"
+"$WT" up feat/x | grep -q 'Refreshed agents' && fail "refresh copied again with nothing to change"
 grep -q "Reusing $PROJECT-wt-feat-x-postgres-data" "$WORK/rerun.log" || fail "volume not reused"
 [ "$(sed -n 's/^DB_PORT=//p' "$WTP/.env")" = "$PG_PORT" ] || fail "port changed on re-run"
 [ "$(sed -n 's/^PORT=//p' "$WTP/.env")" = "$APP_PORT" ] || fail "app port changed on re-run"
@@ -261,3 +273,34 @@ fi
 grep -q 'inside its data dir' "$WORK/nested.log" || fail "wrong error for the nested mount"
 "$WT" down nested-test --yes >/dev/null
 "$WT" ls | grep -q 'No worktree environments' || fail "nested-test left behind"
+
+step "legacy names and the slug label"
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[docker]
+legacy_names = true
+slug_label = "$PROJECT.slug"
+
+[services.postgres]
+database = "app"
+EOF
+"$WT" up legacy-test
+[ "$(docker inspect -f '{{index .Config.Labels "'"$PROJECT"'.slug"}}' "$PROJECT-wt-legacy-test")" = legacy-test ] || fail "legacy container name or slug label"
+[ "$(docker volume inspect -f '{{index .Labels "'"$PROJECT"'.slug"}}' "$PROJECT-wt-legacy-test-db")" = legacy-test ] || fail "legacy volume name or slug label"
+[ "$(docker inspect -f '{{index .Config.Labels "wt.slug"}}' "$PROJECT-wt-legacy-test")" = legacy-test ] || fail "wt.slug missing next to the legacy label"
+"$WT" ls | grep legacy-test | grep -q running || fail "ls does not show the legacy-named environment"
+"$WT" down legacy-test --yes >/dev/null
+docker inspect "$PROJECT-wt-legacy-test" >/dev/null 2>&1 && fail "legacy container left"
+docker volume inspect "$PROJECT-wt-legacy-test-db" >/dev/null 2>&1 && fail "legacy volume left"
+
+step "down accepts the slug label alone, and still refuses a bare lookalike"
+docker volume create --label "$PROJECT.slug=old-one" "$PROJECT-wt-old-one-db" >/dev/null
+"$WT" down old-one --yes >/dev/null
+docker volume inspect "$PROJECT-wt-old-one-db" >/dev/null 2>&1 && fail "down ignored the slug label"
+docker volume create "$PROJECT-wt-bare-db" >/dev/null
+if "$WT" down bare --yes >"$WORK/bare.log" 2>&1; then
+  fail "down removed a volume with no label"
+fi
+grep -q 'not labelled' "$WORK/bare.log" || fail "wrong error for the unlabelled volume"
+docker volume rm "$PROJECT-wt-bare-db" >/dev/null

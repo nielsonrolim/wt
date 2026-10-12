@@ -11,13 +11,46 @@ use anyhow::{Context, Result};
 
 use crate::sh;
 
+/// How a copy treats a file the worktree already has.
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    /// Keep it, so files created or changed inside the worktree survive.
+    Missing,
+    /// Replace it when the content differs; the main checkout wins.
+    Refresh,
+}
+
 /// Copies whatever `src` holds that `dst` lacks; never overwrites, so files
 /// created or changed inside the worktree survive a re-run. `fs::copy` is a
 /// clonefile on APFS, so a large tree costs nothing until something writes.
 pub fn copy_missing(src: &Path, dst: &Path) -> io::Result<u64> {
+    copy_tree(src, dst, Mode::Missing)
+}
+
+/// Like `copy_missing`, but a file whose content differs is replaced, so an
+/// edit in the main checkout reaches worktrees that already exist. Files only
+/// the worktree has are left alone.
+pub fn copy_refresh(src: &Path, dst: &Path) -> io::Result<u64> {
+    copy_tree(src, dst, Mode::Refresh)
+}
+
+fn copy_tree(src: &Path, dst: &Path, mode: Mode) -> io::Result<u64> {
     let meta = fs::symlink_metadata(src)?;
-    if fs::symlink_metadata(dst).is_ok() && !meta.is_dir() {
-        return Ok(0);
+    let existing = fs::symlink_metadata(dst).ok();
+    if existing.is_some() && !meta.is_dir() {
+        if mode == Mode::Missing {
+            return Ok(0);
+        }
+        if meta.is_file() && existing.as_ref().is_some_and(|e| e.is_file()) {
+            if same_content(src, dst)? {
+                return Ok(0);
+            }
+        } else if meta.file_type().is_symlink()
+            && fs::read_link(dst).ok() == fs::read_link(src).ok()
+        {
+            return Ok(0);
+        }
+        fs::remove_file(dst)?;
     }
     if meta.file_type().is_symlink() {
         symlink(fs::read_link(src)?, dst)?;
@@ -34,22 +67,43 @@ pub fn copy_missing(src: &Path, dst: &Path) -> io::Result<u64> {
     let mut copied = 0;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
-        copied += copy_missing(&entry.path(), &dst.join(entry.file_name()))?;
+        copied += copy_tree(&entry.path(), &dst.join(entry.file_name()), mode)?;
     }
     Ok(copied)
 }
 
+fn same_content(a: &Path, b: &Path) -> io::Result<bool> {
+    if fs::metadata(a)?.len() != fs::metadata(b)?.len() {
+        return Ok(false);
+    }
+    Ok(fs::read(a)? == fs::read(b)?)
+}
+
 pub fn copy_paths(main: &Path, worktree: &Path, paths: &[String]) -> Result<()> {
+    copy_listed(main, worktree, paths, "Copied", copy_missing)
+}
+
+/// `app.refresh`: paths kept in step with the main checkout on every run.
+pub fn refresh_paths(main: &Path, worktree: &Path, paths: &[String]) -> Result<()> {
+    copy_listed(main, worktree, paths, "Refreshed", copy_refresh)
+}
+
+fn copy_listed(
+    main: &Path,
+    worktree: &Path,
+    paths: &[String],
+    verb: &str,
+    copy: fn(&Path, &Path) -> io::Result<u64>,
+) -> Result<()> {
     for rel in paths {
         let src = main.join(rel);
         if !src.exists() {
             println!("Skipping {rel}: not in the main checkout");
             continue;
         }
-        let n = copy_missing(&src, &worktree.join(rel))
-            .with_context(|| format!("could not copy {rel}"))?;
+        let n = copy(&src, &worktree.join(rel)).with_context(|| format!("could not copy {rel}"))?;
         if n > 0 {
-            println!("Copied {rel} ({n} files)");
+            println!("{verb} {rel} ({n} files)");
         }
     }
     Ok(())
@@ -125,6 +179,28 @@ mod tests {
             fs::read_to_string(dst.join("ab/cd/blob")).unwrap(),
             "changed in worktree"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn refresh_replaces_changed_files_and_keeps_extras() {
+        let root = scratch("refresh");
+        let (src, dst) = (root.join("src"), root.join("dst"));
+        fs::create_dir_all(src.join("agents")).unwrap();
+        fs::write(src.join("agents/a.md"), "v2").unwrap();
+        fs::write(src.join("agents/same.md"), "same").unwrap();
+        fs::create_dir_all(dst.join("agents")).unwrap();
+        fs::write(dst.join("agents/a.md"), "v1").unwrap();
+        fs::write(dst.join("agents/same.md"), "same").unwrap();
+        fs::write(dst.join("agents/local.md"), "mine").unwrap();
+
+        assert_eq!(copy_refresh(&src, &dst).unwrap(), 1);
+        assert_eq!(fs::read_to_string(dst.join("agents/a.md")).unwrap(), "v2");
+        assert_eq!(
+            fs::read_to_string(dst.join("agents/local.md")).unwrap(),
+            "mine"
+        );
+        assert_eq!(copy_refresh(&src, &dst).unwrap(), 0);
         fs::remove_dir_all(root).unwrap();
     }
 }

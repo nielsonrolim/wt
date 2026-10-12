@@ -12,10 +12,13 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::Service;
 use crate::docker::{self, Container};
-use crate::project::{Env, LABEL_SERVICE};
+use crate::project::Env;
 
 /// Written last, after the copy succeeded: a volume without it is a half-copy.
 const CLONE_MARKER: &str = ".wt-clone-complete";
+/// What `bin/worktree`-style scripts wrote. Honoured so a volume they finished
+/// is reused, not discarded as a half-copy.
+const LEGACY_CLONE_MARKER: &str = ".worktree-clone-complete";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -247,13 +250,15 @@ impl Drop for RestoreOnDrop {
 /// failed (daemon, image, no `sh`), which says nothing about the volume, so
 /// the caller must not treat it as a half-copy and discard the data.
 fn marker_present(image: &str, volume: &str) -> Result<bool> {
-    let out = docker::run_shell(
-        image,
-        &[format!("{volume}:/v")],
-        &format!("if [ -f /v/{CLONE_MARKER} ]; then echo yes; else echo no; fi"),
-    )
-    .with_context(|| format!("could not check whether {volume} is a finished copy"))?;
+    let out = docker::run_shell(image, &[format!("{volume}:/v")], &marker_script())
+        .with_context(|| format!("could not check whether {volume} is a finished copy"))?;
     parse_marker(&out)
+}
+
+fn marker_script() -> String {
+    format!(
+        "if [ -f /v/{CLONE_MARKER} ] || [ -f /v/{LEGACY_CLONE_MARKER} ]; then echo yes; else echo no; fi"
+    )
 }
 
 fn parse_marker(out: &str) -> Result<bool> {
@@ -269,8 +274,17 @@ fn parse_marker(out: &str) -> Result<bool> {
 pub fn prepare_volume(svc: &Service, src: &Source, env: &Env) -> Result<()> {
     let volume = env.volume(svc.kind);
     let image = &src.container.config.image;
-    let mut labels = env.labels().to_vec();
-    labels.push((LABEL_SERVICE, svc.kind.name().to_string()));
+    let labels = env.creation_labels(svc.kind);
+
+    if let Some(existing) = docker::volume(&volume)
+        && !env.owns(|k| existing.label(k))
+    {
+        bail!(
+            "{volume} exists but was not created for {} (wt down {} --force removes it)",
+            env.slug,
+            env.slug
+        );
+    }
 
     if !svc.clone {
         if docker::volume(&volume).is_none() {
@@ -330,6 +344,13 @@ chown "$(stat -c '%u:%g' /from)" /to/{CLONE_MARKER}"#,
 pub fn start(svc: &Service, src: &Source, env: &Env, port: u16) -> Result<()> {
     let name = env.container(svc.kind);
     if let Some(existing) = docker::container(&name) {
+        if !env.owns(|k| existing.label(k)) {
+            bail!(
+                "{name} exists but was not created for {} (wt down {} --force removes it)",
+                env.slug,
+                env.slug
+            );
+        }
         let published = existing.host_ports();
         if !published.contains(&port) {
             bail!(
@@ -348,12 +369,10 @@ pub fn start(svc: &Service, src: &Source, env: &Env, port: u16) -> Result<()> {
 
     let config = &src.container.config;
     let mut args: Vec<String> = vec!["-d".into(), "--name".into(), name.clone()];
-    for (k, v) in env.labels() {
+    for (k, v) in env.creation_labels(svc.kind) {
         args.extend(["--label".into(), format!("{k}={v}")]);
     }
     args.extend([
-        "--label".into(),
-        format!("{LABEL_SERVICE}={}", svc.kind.name()),
         "--restart".into(),
         "unless-stopped".into(),
         "-p".into(),
@@ -492,11 +511,15 @@ fn probe(svc: &Service, src: &Source, name: &str, probe: Probe) -> bool {
                 .is_some()
             } else {
                 let db = svc.database.as_deref().unwrap_or("postgres");
-                docker::exec_output(
-                    name,
-                    &["psql", "-qtAX", "-U", user, "-d", db, "-c", "select 1"],
-                )
-                .is_some_and(|out| out.trim() == "1")
+                let run = |sql: &str| {
+                    docker::exec_output(name, &["psql", "-qtAX", "-U", user, "-d", db, "-c", sql])
+                };
+                match &svc.check_sql {
+                    // The query only has to run: it is the caller's proof that
+                    // the schema survived the copy.
+                    Some(sql) => run(sql).is_some(),
+                    None => run("select 1").is_some_and(|out| out.trim() == "1"),
+                }
             }
         }
         // mysqladmin ping exits 0 whenever the server runs, even on access
@@ -522,6 +545,13 @@ fn probe(svc: &Service, src: &Source, name: &str, probe: Probe) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_finished_copy_by_either_tool_counts() {
+        let script = marker_script();
+        assert!(script.contains("/v/.wt-clone-complete"));
+        assert!(script.contains("/v/.worktree-clone-complete"));
+    }
 
     #[test]
     fn classifies_images() {

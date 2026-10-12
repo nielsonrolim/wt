@@ -39,6 +39,7 @@ pub fn run(branch: &str, base: Option<&str>) -> Result<()> {
         files::copy_sqlite(&main, &env.path, &sqlite.files)?;
     }
     files::copy_paths(&main, &env.path, &cfg.app.copy)?;
+    files::refresh_paths(&main, &env.path, &cfg.app.refresh)?;
 
     let hook_env = hook_env(&main, &cfg, &env, branch, &state);
     hooks::run("setup", &cfg.hooks.setup, &env.path, &hook_env)?;

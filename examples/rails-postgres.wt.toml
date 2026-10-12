@@ -4,8 +4,12 @@
 
 [app]
 copy = ["storage"]   # Active Storage blobs the cloned database points at
+# Untracked files you edit in the main checkout and want every worktree to follow:
+# refresh = [".claude/agents"]
 
 [services.postgres]
+# database = "myapp_development"
+# check_sql = "select count(*) from schema_migrations"   # proves the schema survived the copy
 
 [hooks]
 setup = [

@@ -234,9 +234,19 @@ pub fn volume(name: &str) -> Option<Volume> {
 }
 
 pub fn volumes_labelled(labels: &[(&str, String)]) -> Result<Vec<Volume>> {
-    let names = lines(&sh::output(
-        docker().args(["volume", "ls", "-q"]).args(filters(labels)),
-    )?);
+    inspect_volumes(&["volume", "ls", "-q"], filters(labels))
+}
+
+/// Volumes carrying `key` with any value.
+pub fn volumes_with_label(key: &str) -> Result<Vec<Volume>> {
+    inspect_volumes(
+        &["volume", "ls", "-q"],
+        vec!["--filter".into(), format!("label={key}")],
+    )
+}
+
+fn inspect_volumes(list: &[&str], filter: Vec<String>) -> Result<Vec<Volume>> {
+    let names = lines(&sh::output(docker().args(list).args(filter))?);
     if names.is_empty() {
         return Ok(Vec::new());
     }
