@@ -12,8 +12,20 @@ O que muda de app para app fica num `.wt.toml`; o que dá para descobrir sozinho
 
 ## Instalação
 
+Binários prontos para Linux x86_64 e macOS (Intel e Apple Silicon):
+
 ```bash
-cargo install --path . --root ~/.local   # instala ~/.local/bin/wt
+curl -fsSL https://raw.githubusercontent.com/nielsonrolim/wt/main/install.sh | sh
+```
+
+O script baixa o último release, confere o SHA-256 e instala `~/.local/bin/wt`. `WT_VERSION=v0.2.0` fixa um release e `WT_INSTALL_DIR` muda onde o binário vai.
+
+Com Rust:
+
+```bash
+cargo binstall --git https://github.com/nielsonrolim/wt wt   # baixa o binário pronto
+cargo install --git https://github.com/nielsonrolim/wt --locked   # compila do código
+cargo install --path . --root ~/.local   # a partir de um clone; instala ~/.local/bin/wt
 ```
 
 Requer `git` e `docker` (Docker Desktop, OrbStack ou colima). Usa, se estiverem instalados: Herdr, `direnv` e `sqlite3`.

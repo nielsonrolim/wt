@@ -12,8 +12,20 @@ Whatever differs between apps lives in a `.wt.toml`. Everything `wt` can find ou
 
 ## Installation
 
+Prebuilt binaries for Linux x86_64 and macOS (Intel and Apple Silicon):
+
 ```bash
-cargo install --path . --root ~/.local   # installs ~/.local/bin/wt
+curl -fsSL https://raw.githubusercontent.com/nielsonrolim/wt/main/install.sh | sh
+```
+
+The script downloads the latest release, checks its SHA-256 and installs `~/.local/bin/wt`. `WT_VERSION=v0.2.0` pins a release and `WT_INSTALL_DIR` changes where the binary goes.
+
+With Rust:
+
+```bash
+cargo binstall --git https://github.com/nielsonrolim/wt wt   # fetches the prebuilt binary
+cargo install --git https://github.com/nielsonrolim/wt --locked   # builds from source
+cargo install --path . --root ~/.local   # from a clone; installs ~/.local/bin/wt
 ```
 
 Requires `git` and `docker` (Docker Desktop, OrbStack or colima). Uses Herdr, `direnv` and `sqlite3` when they are installed.
