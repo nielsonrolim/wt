@@ -40,7 +40,7 @@ latest_tag() {
 }
 
 case "$(uname -s)/$(uname -m)" in
-Linux/x86_64 | Linux/amd64) target=x86_64-unknown-linux-gnu ;;
+Linux/x86_64 | Linux/amd64) target=x86_64-unknown-linux-musl ;;
 Darwin/x86_64) target=x86_64-apple-darwin ;;
 Darwin/arm64 | Darwin/aarch64) target=aarch64-apple-darwin ;;
 *) die "no prebuilt binary for $(uname -s) $(uname -m); use: cargo install --git $repo --locked" ;;
@@ -57,7 +57,14 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
 echo "Downloading wt $tag for $target"
-fetch "$repo/releases/download/$tag/$name" "$tmp/$name" || die "could not download $name"
+if ! fetch "$repo/releases/download/$tag/$name" "$tmp/$name" 2>/dev/null; then
+	# Releases up to v0.2.0 shipped a glibc build instead of the static one.
+	[ "$target" = x86_64-unknown-linux-musl ] || die "could not download $name"
+	target=x86_64-unknown-linux-gnu
+	name="wt-$tag-$target.tar.gz"
+	echo "No static build in $tag; falling back to $target"
+	fetch "$repo/releases/download/$tag/$name" "$tmp/$name" || die "could not download $name"
+fi
 fetch "$repo/releases/download/$tag/$name.sha256" "$tmp/$name.sha256" || die "could not download $name.sha256"
 
 (
