@@ -25,6 +25,18 @@ fail() {
 cleanup() {
   local rc=$?
   set +e
+  # Drop copies inside the instances before their volumes go away, so a
+  # leftover never outlives the fixture (and the final step can prove it).
+  for db in $(docker compose exec -T postgres psql -qtAX -U app -d postgres \
+    -c "select datname from pg_database where datname like 'wt_wte2e%'" 2>/dev/null); do
+    docker compose exec -T postgres psql -qU app -d postgres \
+      -c "drop database $db with (force)" >/dev/null 2>&1
+  done
+  for db in $(docker compose exec -T mariadb mariadb -uroot -papp -N -B \
+    -e "select schema_name from information_schema.schemata where schema_name like 'wt_wte2e%'" 2>/dev/null); do
+    docker compose exec -T mariadb mariadb -uroot -papp \
+      -e "drop database $db" >/dev/null 2>&1
+  done
   for id in $(docker ps -aq --filter "label=wt.project=$PROJECT"); do docker rm -f "$id" >/dev/null; done
   for v in $(docker volume ls -q --filter "label=wt.project=$PROJECT"); do docker volume rm -f "$v" >/dev/null; done
   (cd "$REPO" 2>/dev/null && docker compose down -v >/dev/null 2>&1)
@@ -45,6 +57,7 @@ cat >docker-compose.yaml <<'EOF'
 services:
   postgres:
     image: postgres:16.7-alpine
+    ports: ["127.0.0.1::5432"]
     environment:
       POSTGRES_USER: app
       POSTGRES_PASSWORD: app
@@ -57,9 +70,12 @@ services:
       - pg-data:/var/lib/postgresql/data
   mariadb:
     image: mariadb:11
+    ports: ["127.0.0.1::3306", "127.0.0.1::33060"]
     environment:
       MARIADB_ROOT_PASSWORD: app
       MARIADB_DATABASE: app
+      MARIADB_USER: app
+      MARIADB_PASSWORD: app
     healthcheck:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 1s
@@ -70,6 +86,18 @@ services:
     image: redis:7-alpine
     volumes:
       - redis-data:/data
+  # A source with no published port: database mode cannot reach it from the host.
+  pg-noport:
+    image: postgres:16.7-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "app", "-d", "app"]
+      interval: 1s
+      retries: 60
+    volumes:
+      - pg-noport-data:/var/lib/postgresql/data
   # A source whose data is split across mounts: wt must refuse to clone it.
   z-nested:
     image: postgres:16.7-alpine
@@ -81,9 +109,10 @@ volumes:
   pg-data:
   mariadb-data:
   redis-data:
+  pg-noport-data:
   z-nested-data:
 EOF
-printf '/.env*\n/storage/*\n!/storage/.keep\n/agents/\n' >.gitignore
+printf '/.env*\n/.envrc\n/hook-*.out\n/storage/*\n!/storage/.keep\n/agents/\n' >.gitignore
 touch storage/.keep
 printf 'SECRET=main\nDB_PORT=5432\n' >.env
 echo '{}' >package.json
@@ -91,8 +120,17 @@ git add -A && git commit --quiet -m init
 
 docker compose up -d --wait >/dev/null 2>&1
 docker compose exec -T postgres psql -qU app -d app -c "create table marker(v text); insert into marker values ('cloned');" >/dev/null
+# Extra logical databases, a non-default encoding and an object owned by another role.
+docker compose exec -T postgres psql -qU app -d postgres -c "create database app_cache" >/dev/null
+docker compose exec -T postgres psql -qU app -d app_cache -c "create table marker(v text); insert into marker values ('cache');" >/dev/null
+docker compose exec -T postgres psql -qU app -d postgres -c "create database app_latin template template0 encoding 'LATIN1' lc_collate 'C' lc_ctype 'C'" >/dev/null
+docker compose exec -T postgres psql -qU app -d app_latin -c "create table marker(v text); insert into marker values ('latin');" >/dev/null
+docker compose exec -T postgres psql -qU app -d app -c "create table primary_only(v int); insert into primary_only values (1); create role app2; create table owned_by_app2(v int); alter table owned_by_app2 owner to app2;" >/dev/null
 docker compose exec -T redis sh -c 'redis-cli set marker cloned >/dev/null && redis-cli save >/dev/null'
 docker compose exec -T mariadb mariadb -uroot -papp app -e "create table marker(v text); insert into marker values ('cloned');" >/dev/null
+docker compose exec -T mariadb mariadb -uroot -papp -e "create database app_aux character set utf8mb4 collate utf8mb4_bin" >/dev/null
+docker compose exec -T mariadb mariadb -uroot -papp app_aux -e "create table marker(v text); insert into marker values ('aux');" >/dev/null
+docker compose exec -T mariadb mariadb -uroot -papp app -e "create procedure proc() select 1; create trigger trg before insert on marker for each row set new.v = new.v;" >/dev/null
 sqlite3 storage/development.sqlite3 "create table marker(v text); insert into marker values ('cloned');"
 mkdir -p storage/ab && echo blob >storage/ab/blob
 mkdir -p agents && echo v1 >agents/a.md
@@ -105,6 +143,7 @@ grep -q "source = \"$PROJECT-mariadb-1\"" .wt.toml || fail "init missed the mysq
 grep -q '^\[services.redis\]' .wt.toml || fail "init missed redis"
 grep -q 'storage/development.sqlite3' .wt.toml || fail "init missed sqlite"
 grep -q 'copy = \["storage"\]' .wt.toml || fail "init missed storage"
+grep -q 'mode =' .wt.toml && fail "init generated a mode = line"
 "$WT" init 2>/dev/null && fail "init overwrote without --force"
 
 cat >.wt.toml <<EOF
@@ -133,6 +172,7 @@ after_services = [["sh", "-c", "echo \$WT_POSTGRES_PORT \$WT_MYSQL_PORT \$WT_RED
 EOF
 
 step "wt up feat/x"
+PG_STARTED="$(docker inspect -f '{{.State.StartedAt}}' "$PROJECT-postgres-1")"
 "$WT" up feat/x
 WTP="$WORK/root/feat-x"
 [ -d "$WTP" ] || fail "no checkout"
@@ -163,6 +203,8 @@ mysql_port="$(docker port "$PROJECT-wt-feat-x-mysql" 3306/tcp)"
 read -r hp hm hr ha <"$WTP/hook-after.out"
 [ "$hp" = "$PG_PORT" ] && [ "$hm" = "$MYSQL_PORT" ] && [ "$ha" = "$APP_PORT" ] && [ -n "$hr" ] || fail "after_services hook env"
 [ "$(docker inspect -f '{{.State.Running}}' "$PROJECT-postgres-1")" = true ] || fail "source not restarted"
+[ "$PG_STARTED" != "$(docker inspect -f '{{.State.StartedAt}}' "$PROJECT-postgres-1")" ] ||
+  fail "a byte copy must stop and restart the source"
 
 [ "$(cat "$WTP/agents/a.md")" = v1 ] || fail "refresh path not copied"
 
@@ -171,6 +213,7 @@ echo "LOCAL=1" >>"$WTP/.env"
 echo v2 >agents/a.md
 echo mine >"$WTP/agents/local.md"
 echo changed >"$WTP/storage/ab/blob"
+RERUN_STARTED="$(docker inspect -f '{{.State.StartedAt}}' "$PROJECT-postgres-1")"
 "$WT" up feat/x | tee "$WORK/rerun.log"
 [ "$(cat "$WTP/agents/a.md")" = v2 ] || fail "refresh did not follow the main checkout"
 [ "$(cat "$WTP/agents/local.md")" = mine ] || fail "refresh removed a worktree-only file"
@@ -181,6 +224,8 @@ grep -q "Reusing $PROJECT-wt-feat-x-postgres-data" "$WORK/rerun.log" || fail "vo
 [ "$(sed -n 's/^PORT=//p' "$WTP/.env")" = "$APP_PORT" ] || fail "app port changed on re-run"
 grep -q '^LOCAL=1$' "$WTP/.env" || fail "hand edit lost"
 [ "$(grep -c 'Written by wt up' "$WTP/.env")" = 1 ] || fail "banner stacked"
+[ "$RERUN_STARTED" = "$(docker inspect -f '{{.State.StartedAt}}' "$PROJECT-postgres-1")" ] ||
+  fail "a re-run must not touch the source"
 
 step "a branch with the same slug is refused"
 "$WT" up feat-x 2>/dev/null && fail "feat-x reused feat/x's worktree"
@@ -260,6 +305,536 @@ git show-ref --verify --quiet refs/heads/feat/y && fail "--delete-branch kept th
 docker volume inspect "${PROJECT}_pg-data" >/dev/null || fail "source volume touched"
 "$WT" ls | grep -q 'No worktree environments' || fail "ls not empty"
 
+# ---------------------------------------------------------------------------
+# Database mode: copies logical databases inside the source instance.
+# ---------------------------------------------------------------------------
+STATE_DIR="$XDG_STATE_HOME/wt/$PROJECT"
+HOST="$(docker port "$PROJECT-postgres-1" 5432/tcp | sed 's/.*://')"
+MYSQL_HOST="$(docker port "$PROJECT-mariadb-1" 3306/tcp | sed 's/.*://')"
+pg() { docker exec "$PROJECT-postgres-1" psql -qtAX -U app -d postgres -c "$1"; }
+pg_of() { docker exec "$PROJECT-postgres-1" psql -qtAX -U app -d "$1" -c "$2"; }
+my() {
+  if [ "$#" -ge 2 ]; then
+    docker exec "$PROJECT-mariadb-1" mariadb -uroot -papp -N -B -e "$1" "$2"
+  else
+    docker exec "$PROJECT-mariadb-1" mariadb -uroot -papp -N -B -e "$1"
+  fi
+}
+
+step "database mode: up copies two logical databases without a container"
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[services.postgres]
+mode = "database"
+databases = ["app", "app_cache"]
+env = { DB_HOST = "127.0.0.1", DB_PORT = "{port}", DATABASE_URL = "postgres://app:app@127.0.0.1:{port}/{database}", CACHE_URL = "postgres://app:app@127.0.0.1:{port}/{database:app_cache}" }
+check_sql = "select count(*) from primary_only"
+
+[hooks]
+after_services = [["sh", "-c", "printf '%s|%s|%s' \"\$WT_POSTGRES_DATABASE\" \"\$WT_POSTGRES_DATABASES\" \"\$WT_POSTGRES_PORT\" > hook-db.out"]]
+EOF
+STARTED_AT="$(docker inspect -f '{{.State.StartedAt}}' "$PROJECT-postgres-1")"
+"$WT" up db/a | tee "$WORK/db-a.log"
+DBA="$WORK/root/db-a"
+[ -d "$DBA" ] || fail "no db/a checkout"
+[ -z "$(docker ps -aq --filter "label=wt.slug=db-a")" ] || fail "database mode created a container"
+[ -z "$(docker volume ls -q --filter "label=wt.slug=db-a")" ] || fail "database mode created a volume"
+[ "$(docker inspect -f '{{.State.StartedAt}}' "$PROJECT-postgres-1")" = "$STARTED_AT" ] || fail "database mode stopped the source"
+[ "$(docker inspect -f '{{.State.Running}}' "$PROJECT-postgres-1")" = true ] || fail "source not running"
+[ "$(pg "select count(*) from pg_database where datname like 'wt_wte2e_db_a__%'")" = 2 ] || fail "expected two copies"
+[ "$(pg "select shobj_description(oid,'pg_database') from pg_database where datname='wt_wte2e_db_a__app'")" = "wt.project=wte2e;wt.slug=db-a;wt.complete=1" ] || fail "postgres marker"
+[ "$(pg_of wt_wte2e_db_a__app 'select v from marker')" = cloned ] || fail "app data not copied"
+[ "$(pg_of wt_wte2e_db_a__app_cache 'select v from marker')" = cache ] || fail "cache data not copied"
+[ "$(pg_of wt_wte2e_db_a__app "select tableowner from pg_tables where tablename='owned_by_app2'")" = app2 ] || fail "object owner not preserved"
+[ "$(pg "select pg_get_userbyid(datdba) from pg_database where datname='wt_wte2e_db_a__app'")" = "$(pg "select pg_get_userbyid(datdba) from pg_database where datname='app'")" ] || fail "database owner not preserved"
+grep -q "^DATABASE_URL=postgres://app:app@127.0.0.1:$HOST/wt_wte2e_db_a__app$" "$DBA/.env" || fail "DATABASE_URL"
+grep -q "^CACHE_URL=postgres://app:app@127.0.0.1:$HOST/wt_wte2e_db_a__app_cache$" "$DBA/.env" || fail "CACHE_URL"
+[ "$(sed -n 's/^DB_PORT=//p' "$DBA/.env")" = "$HOST" ] || fail "DB_PORT is not the source port"
+[ "$(stat -c %a "$DBA/.env" 2>/dev/null || stat -f %Lp "$DBA/.env")" = 600 ] || fail ".env mode"
+[ "$(grep -c 'Written by wt up' "$DBA/.env")" = 1 ] || fail "banner"
+[ "$(cat "$DBA/hook-db.out")" = "wt_wte2e_db_a__app|app=wt_wte2e_db_a__app,app_cache=wt_wte2e_db_a__app_cache|$HOST" ] || fail "hook env"
+grep -qE "postgres +127.0.0.1:$HOST \(databases wt_wte2e_db_a__app, wt_wte2e_db_a__app_cache\)" "$WORK/db-a.log" || fail "report"
+[ "$(sed -n 's/^postgres = //p' "$STATE_DIR/db-a.toml")" = "$HOST" ] || fail "state port"
+[ "$(grep -c '^\[\[databases\]\]' "$STATE_DIR/db-a.toml")" = 2 ] || fail "state copies"
+grep -q 'target = "wt_wte2e_db_a__app"' "$STATE_DIR/db-a.toml" || fail "state target app"
+grep -q 'target = "wt_wte2e_db_a__app_cache"' "$STATE_DIR/db-a.toml" || fail "state target cache"
+
+step "database mode: encoding and collation follow the source"
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[services.postgres]
+mode = "database"
+databases = ["app_latin"]
+env = { DATABASE_URL = "postgres://app:app@127.0.0.1:{port}/{database}" }
+EOF
+"$WT" up db/enc >/dev/null
+ENC="$(pg "select pg_encoding_to_char(encoding)||'|'||datcollate||'|'||datctype from pg_database where datname='app_latin'")"
+TARGET_ENC="$(pg "select pg_encoding_to_char(encoding)||'|'||datcollate||'|'||datctype from pg_database where datname='wt_wte2e_db_enc__app_latin'")"
+[ "$ENC" = "$TARGET_ENC" ] || fail "encoding/collation not copied"
+[ "$TARGET_ENC" = "LATIN1|C|C" ] || fail "fixture encoding wrong: $TARGET_ENC"
+[ "$(pg_of wt_wte2e_db_enc__app_latin 'select v from marker')" = latin ] || fail "latin data not copied"
+"$WT" down db/enc --yes >/dev/null
+
+step "database mode: a second worktree shares the source port"
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[services.postgres]
+mode = "database"
+databases = ["app", "app_cache"]
+env = { DB_HOST = "127.0.0.1", DB_PORT = "{port}", DATABASE_URL = "postgres://app:app@127.0.0.1:{port}/{database}", CACHE_URL = "postgres://app:app@127.0.0.1:{port}/{database:app_cache}" }
+EOF
+"$WT" up db/b >/dev/null
+DBA_URL="$(sed -n 's/^DATABASE_URL=//p' "$DBA/.env")"
+DBB_URL="$(sed -n 's/^DATABASE_URL=//p' "$WORK/root/db-b/.env")"
+[ "$DBA_URL" != "$DBB_URL" ] || fail "the two worktrees share a database"
+[ "$(sed -n 's/^DB_PORT=//p' "$WORK/root/db-b/.env")" = "$HOST" ] || fail "db/b did not reuse the source port"
+[ -z "$(docker ps -aq --filter "label=wt.slug=db-b")" ] || fail "db/b created a container"
+"$WT" ls >"$WORK/ls-db.log"
+awk -v s=db-a -v p="$HOST" '$1==s && $4==p {ok=1} END{exit !ok}' "$WORK/ls-db.log" || fail "ls db-a port"
+awk -v s=db-b -v p="$HOST" '$1==s && $4==p {ok=1} END{exit !ok}' "$WORK/ls-db.log" || fail "ls db-b port"
+"$WT" down db/b --yes >/dev/null
+
+step "database mode: a re-run does not recopy"
+pg_of wt_wte2e_db_a__app "insert into marker values ('edited')"
+pg_of app "create table later(x int)"
+RERUN_STARTED="$(docker inspect -f '{{.State.StartedAt}}' "$PROJECT-postgres-1")"
+"$WT" up db/a >"$WORK/db-a-rerun.log" 2>&1
+grep -q 'Reusing wt_wte2e_db_a__app$' "$WORK/db-a-rerun.log" || fail "app copy not reused"
+grep -q 'Reusing wt_wte2e_db_a__app_cache$' "$WORK/db-a-rerun.log" || fail "cache copy not reused"
+! grep -q 'no longer in' "$WORK/db-a-rerun.log" || fail "a plain re-run warned about stale copies"
+[ "$(pg_of wt_wte2e_db_a__app "select count(*) from marker where v='edited'")" = 1 ] || fail "re-run overwrote a copy"
+[ "$(pg_of wt_wte2e_db_a__app "select count(*) from pg_tables where tablename='later'")" = 0 ] || fail "re-run recopied the source"
+[ "$(pg_of app "select count(*) from pg_tables where tablename='later'")" = 1 ] || fail "fixture table missing in the source"
+grep -q "^DATABASE_URL=postgres://app:app@127.0.0.1:$HOST/wt_wte2e_db_a__app$" "$DBA/.env" || fail ".env changed on re-run"
+[ "$(grep -c 'Written by wt up' "$DBA/.env")" = 1 ] || fail "banner stacked"
+[ "$(docker inspect -f '{{.State.StartedAt}}' "$PROJECT-postgres-1")" = "$RERUN_STARTED" ] || fail "re-run touched the source"
+[ -z "$(git -C "$DBA" status --porcelain | grep -v '^?? hook-db.out$')" ] || fail "the worktree is dirty"
+
+step "database mode: a half-copied database is recreated alone"
+pg "comment on database wt_wte2e_db_a__app_cache is 'wt.project=wte2e;wt.slug=db-a;wt.complete=0'"
+pg_of wt_wte2e_db_a__app_cache "delete from marker"
+"$WT" up db/a >"$WORK/db-a-recreate.log" 2>&1
+grep -q 'Recreating wt_wte2e_db_a__app_cache' "$WORK/db-a-recreate.log" || fail "cache copy not recreated"
+grep -q 'Reusing wt_wte2e_db_a__app$' "$WORK/db-a-recreate.log" || fail "complete copy recreated"
+[ "$(pg_of wt_wte2e_db_a__app_cache 'select v from marker')" = cache ] || fail "cache rows not restored"
+[ "$(pg "select shobj_description(oid,'pg_database') from pg_database where datname='wt_wte2e_db_a__app_cache'")" = "wt.project=wte2e;wt.slug=db-a;wt.complete=1" ] || fail "marker not restored"
+[ "$(pg_of wt_wte2e_db_a__app "select count(*) from marker where v='edited'")" = 1 ] || fail "the complete copy was recreated"
+
+step "database mode: a foreign database is refused and left alone"
+pg "create database wt_wte2e_db_foreign__app"
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[services.postgres]
+mode = "database"
+databases = ["app"]
+env = { DATABASE_URL = "postgres://app:app@127.0.0.1:{port}/{database}" }
+EOF
+if "$WT" up db/foreign >"$WORK/foreign.log" 2>&1; then fail "up adopted a foreign database"; fi
+grep -q 'was not created by wt' "$WORK/foreign.log" || fail "wrong foreign error"
+[ "$(pg "select count(*) from pg_database where datname='wt_wte2e_db_foreign__app'")" = 1 ] || fail "foreign database dropped"
+[ "$(pg "select count(*) from pg_database where datname='wt_wte2e_db_foreign__app' and shobj_description(oid,'pg_database') is null")" = 1 ] || fail "foreign database marker changed"
+[ ! -e "$STATE_DIR/db-foreign.toml" ] || fail "state written on foreign refusal"
+[ ! -e "$WORK/root/db-foreign" ] || fail "worktree created on foreign refusal"
+pg "drop database wt_wte2e_db_foreign__app"
+
+step "database mode: a source without a published port is refused"
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[services.postgres]
+source = "$PROJECT-pg-noport-1"
+mode = "database"
+databases = ["app"]
+env = { DATABASE_URL = "postgres://app:app@127.0.0.1:{port}/{database}" }
+EOF
+if "$WT" up noport/a >"$WORK/noport.log" 2>&1; then fail "up accepted a source without a published port"; fi
+grep -q 'publishes no host port' "$WORK/noport.log" || fail "wrong noport error"
+[ ! -e "$WORK/root/noport-a" ] || fail "worktree created on noport refusal"
+[ ! -e "$STATE_DIR/noport-a.toml" ] || fail "state written on noport refusal"
+[ "$(docker inspect -f '{{.State.Running}}' "$PROJECT-pg-noport-1")" = true ] || fail "noport source disturbed"
+
+step "database mode: a stopped source is not started"
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[services.postgres]
+mode = "database"
+databases = ["app"]
+env = { DATABASE_URL = "postgres://app:app@127.0.0.1:{port}/{database}" }
+EOF
+docker stop "$PROJECT-postgres-1" >/dev/null
+if "$WT" up db/stopped >"$WORK/stopped.log" 2>&1; then fail "up accepted a stopped source"; fi
+grep -q "docker start $PROJECT-postgres-1" "$WORK/stopped.log" || fail "wrong stopped-source error"
+[ "$(docker inspect -f '{{.State.Running}}' "$PROJECT-postgres-1")" = false ] || fail "wt started the source"
+[ ! -e "$STATE_DIR/db-stopped.toml" ] || fail "state written on stopped-source refusal"
+docker start "$PROJECT-postgres-1" >/dev/null
+# An ephemeral published port can change across a stop/start.
+HOST="$(docker port "$PROJECT-postgres-1" 5432/tcp | sed 's/.*://')"
+
+step "database mode: redis is refused by the config"
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[services.postgres]
+mode = "database"
+databases = ["app"]
+env = { DATABASE_URL = "postgres://app:app@127.0.0.1:{port}/{database}" }
+
+[services.redis]
+mode = "database"
+EOF
+if "$WT" up db/redis >"$WORK/redis.log" 2>&1; then fail "up accepted redis in database mode"; fi
+grep -q 'Redis has no separate databases' "$WORK/redis.log" || fail "wrong redis error"
+[ ! -e "$WORK/root/db-redis" ] || fail "worktree created on redis refusal"
+[ ! -e "$STATE_DIR/db-redis.toml" ] || fail "state written on redis refusal"
+
+step "database mode: two source names that map to the same target are refused"
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[services.postgres]
+mode = "database"
+databases = ["app", "APP"]
+env = { DATABASE_URL = "postgres://app:app@127.0.0.1:{port}/{database}" }
+EOF
+if "$WT" up db/dup >"$WORK/dup.log" 2>&1; then fail "up accepted colliding database names"; fi
+grep -q 'app' "$WORK/dup.log" && grep -q 'APP' "$WORK/dup.log" && grep -q 'wt_wte2e_db_dup__app' "$WORK/dup.log" || fail "wrong collision error"
+[ "$(pg "select count(*) from pg_database where datname like 'wt_wte2e_db_dup__%'")" = 0 ] || fail "collision created a database"
+[ ! -e "$STATE_DIR/db-dup.toml" ] || fail "state written on collision"
+[ ! -e "$WORK/root/db-dup" ] || fail "worktree created on collision"
+
+step "database mode: mysql copies two databases, routines and grants"
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[services.mysql]
+mode = "database"
+source = "$PROJECT-mariadb-1"
+databases = ["app", "app_aux"]
+env = { DB_HOST = "127.0.0.1", DB_PORT = "{port}", DATABASE_URL = "mysql://app:app@127.0.0.1:{port}/{database}", AUX_URL = "mysql://app:app@127.0.0.1:{port}/{database:app_aux}" }
+EOF
+"$WT" up db/mysql >"$WORK/db-mysql.log" 2>&1
+DBM="$WORK/root/db-mysql"
+[ "$(sed -n 's/^DB_PORT=//p' "$DBM/.env")" = "$MYSQL_HOST" ] || fail "mysql port is not the source port"
+[ "$(my "select count(*) from information_schema.schemata where schema_name like 'wt_wte2e_db_mysql__%'")" = 2 ] || fail "expected two mysql copies"
+[ "$(my "select v from __wt_meta where k='wt.complete'" wt_wte2e_db_mysql__app)" = 1 ] || fail "mysql marker"
+[ "$(my "select count(*) from marker" wt_wte2e_db_mysql__app)" = "$(my "select count(*) from marker" app)" ] || fail "mysql app data"
+[ "$(my "select count(*) from marker" wt_wte2e_db_mysql__app_aux)" = "$(my "select count(*) from marker" app_aux)" ] || fail "mysql aux data"
+AUX_CS="$(my "select default_character_set_name, default_collation_name from information_schema.schemata where schema_name='app_aux'")"
+AUX_COPY_CS="$(my "select default_character_set_name, default_collation_name from information_schema.schemata where schema_name='wt_wte2e_db_mysql__app_aux'")"
+[ "$AUX_CS" = "$AUX_COPY_CS" ] || fail "mysql charset/collation not copied"
+FORIG="$(my "select count(*) from information_schema.routines where routine_schema='app'")"
+FCOPY="$(my "select count(*) from information_schema.routines where routine_schema='wt_wte2e_db_mysql__app'")"
+[ "$FORIG" = "$FCOPY" ] && [ "$FORIG" -ge 1 ] || fail "mysql routines not copied"
+[ "$(docker exec "$PROJECT-mariadb-1" mariadb -uapp -papp -N -B -e 'select v from marker' wt_wte2e_db_mysql__app)" = cloned ] || fail "mysql grant missing"
+"$WT" down db/mysql --yes >/dev/null
+
+step "database mode: down drops every copy and never the source"
+STARTED_AT="$(docker inspect -f '{{.State.StartedAt}}' "$PROJECT-postgres-1")"
+"$WT" down db/a --yes | tee "$WORK/db-a-down.log"
+grep -q "database wt_wte2e_db_a__app (source $PROJECT-postgres-1, from app)" "$WORK/db-a-down.log" || fail "describe app copy"
+grep -q "database wt_wte2e_db_a__app_cache (source $PROJECT-postgres-1, from app_cache)" "$WORK/db-a-down.log" || fail "describe cache copy"
+[ "$(pg "select count(*) from pg_database where datname like 'wt_wte2e_db_a__%'")" = 0 ] || fail "copies left"
+[ "$(pg "select count(*) from pg_database where datname in ('app','app_cache')")" = 2 ] || fail "source databases dropped"
+[ "$(pg_of app 'select v from marker')" = cloned ] || fail "source data lost"
+[ "$(docker inspect -f '{{.State.StartedAt}}' "$PROJECT-postgres-1")" = "$STARTED_AT" ] || fail "down touched the source"
+[ ! -e "$STATE_DIR/db-a.toml" ] || fail "state left"
+[ ! -e "$DBA" ] || fail "checkout left"
+
+step "database mode: down refuses a copy with no marker and never drops the source"
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[services.postgres]
+mode = "database"
+databases = ["app"]
+env = { DATABASE_URL = "postgres://app:app@127.0.0.1:{port}/{database}" }
+EOF
+"$WT" up db/look >/dev/null
+pg "comment on database wt_wte2e_db_look__app is null"
+"$WT" down db/look --yes 2>"$WORK/look.log" && fail "down dropped an untagged copy"
+grep -q 'not tagged for wte2e/db-look' "$WORK/look.log" || fail "wrong untagged error"
+[ "$(pg "select count(*) from pg_database where datname='wt_wte2e_db_look__app'")" = 1 ] || fail "untagged copy dropped"
+[ -d "$WORK/root/db-look" ] || fail "the refused down removed the checkout"
+[ -e "$STATE_DIR/db-look.toml" ] || fail "the refused down removed the state"
+"$WT" down db/look --yes --force >/dev/null
+[ "$(pg "select count(*) from pg_database where datname='wt_wte2e_db_look__app'")" = 0 ] || fail "--force did not drop the untagged copy"
+
+"$WT" up db/look2 >/dev/null
+sed -i 's/^target = .*/target = "app"/' "$STATE_DIR/db-look2.toml"
+"$WT" down db/look2 --yes --force 2>"$WORK/look2.log" && fail "down dropped the source database"
+grep -q 'refusing to drop app' "$WORK/look2.log" || fail "wrong source guard error"
+[ "$(pg "select count(*) from pg_database where datname='app'")" = 1 ] || fail "source database dropped"
+[ "$(pg_of app 'select v from marker')" = cloned ] || fail "source data lost"
+sed -i 's/^target = "app"/target = "wt_wte2e_db_look2__app"/' "$STATE_DIR/db-look2.toml"
+"$WT" up db/look2 >/dev/null
+"$WT" down db/look2 --yes >/dev/null
+
+step "database mode: down with the source stopped keeps the state"
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[services.postgres]
+mode = "database"
+databases = ["app", "app_cache"]
+env = { DATABASE_URL = "postgres://app:app@127.0.0.1:{port}/{database}", CACHE_URL = "postgres://app:app@127.0.0.1:{port}/{database:app_cache}" }
+EOF
+"$WT" up db/off >/dev/null
+docker stop "$PROJECT-postgres-1" >/dev/null
+"$WT" down db/off --yes 2>"$WORK/db-off.log" && fail "down dropped with the source stopped"
+grep -q "docker start $PROJECT-postgres-1" "$WORK/db-off.log" || fail "wrong stopped-source down error"
+[ -d "$WORK/root/db-off" ] || fail "the refused down removed the checkout"
+[ "$(grep -c '^\[\[databases\]\]' "$STATE_DIR/db-off.toml")" = 2 ] || fail "state lost on the refused down"
+[ "$(docker inspect -f '{{.State.Running}}' "$PROJECT-postgres-1")" = false ] || fail "down started the source"
+"$WT" down db/off --yes --force >/dev/null
+[ ! -e "$WORK/root/db-off" ] || fail "checkout left after --force"
+[ "$(grep -c '^\[\[databases\]\]' "$STATE_DIR/db-off.toml")" = 2 ] || fail "--force dropped the state"
+docker start "$PROJECT-postgres-1" >/dev/null
+HOST="$(docker port "$PROJECT-postgres-1" 5432/tcp | sed 's/.*://')"
+"$WT" down db/off --yes --force >/dev/null
+[ "$(pg "select count(*) from pg_database where datname like 'wt_wte2e_db_off__%'")" = 0 ] || fail "copies left after the source came back"
+[ ! -e "$STATE_DIR/db-off.toml" ] || fail "state left after the source came back"
+
+step "database mode: --keep-checkout drops the copies and keeps the checkout"
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[services.postgres]
+mode = "database"
+databases = ["app", "app_cache"]
+env = { DB_HOST = "127.0.0.1", DB_PORT = "{port}", DATABASE_URL = "postgres://app:app@127.0.0.1:{port}/{database}", CACHE_URL = "postgres://app:app@127.0.0.1:{port}/{database:app_cache}" }
+EOF
+"$WT" up db/keep >/dev/null
+"$WT" down db/keep --keep-checkout --yes >/dev/null
+[ "$(pg "select count(*) from pg_database where datname like 'wt_wte2e_db_keep__%'")" = 0 ] || fail "copies left after --keep-checkout"
+[ -d "$WORK/root/db-keep" ] || fail "--keep-checkout removed the checkout"
+grep -q '^app_port' "$STATE_DIR/db-keep.toml" || fail "app_port lost"
+grep -q '^\[ports\]' "$STATE_DIR/db-keep.toml" && fail "ports not cleared"
+grep -q '^\[\[databases\]\]' "$STATE_DIR/db-keep.toml" && fail "databases not cleared"
+git show-ref --verify --quiet refs/heads/db/keep || fail "--keep-checkout deleted the branch"
+"$WT" up db/keep >/dev/null
+[ "$(pg "select count(*) from pg_database where datname like 'wt_wte2e_db_keep__%'")" = 2 ] || fail "copies not recreated"
+[ "$(sed -n 's/^DB_PORT=//p' "$WORK/root/db-keep/.env")" = "$HOST" ] || fail "port after recreate"
+
+step "database mode: a database removed from the config is kept and warned about"
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[services.postgres]
+mode = "database"
+databases = ["app", "app_cache"]
+env = { DATABASE_URL = "postgres://app:app@127.0.0.1:{port}/{database}", CACHE_URL = "postgres://app:app@127.0.0.1:{port}/{database:app_cache}" }
+EOF
+"$WT" up db/mix >/dev/null
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[services.postgres]
+mode = "database"
+databases = ["app"]
+env = { DATABASE_URL = "postgres://app:app@127.0.0.1:{port}/{database}" }
+EOF
+"$WT" up db/mix >/dev/null 2>"$WORK/stale.log"
+grep -qF 'no longer in services.postgres.databases' "$WORK/stale.log" || fail "no stale warning"
+grep -qE 'CACHE_URL.*wt_wte2e_db_mix__app_cache|wt_wte2e_db_mix__app_cache.*CACHE_URL' "$WORK/stale.log" || fail "the warning does not name the key and the target"
+[ "$(pg "select count(*) from pg_database where datname='wt_wte2e_db_mix__app_cache'")" = 1 ] || fail "the kept copy was dropped"
+grep -q '^CACHE_URL=' "$WORK/root/db-mix/.env" || fail "CACHE_URL removed silently"
+[ "$(grep -c '^\[\[databases\]\]' "$STATE_DIR/db-mix.toml")" = 2 ] || fail "state lost the kept copy"
+"$WT" down db/mix --yes >/dev/null
+[ "$(pg "select count(*) from pg_database where datname like 'wt_wte2e_db_mix__%'")" = 0 ] || fail "down left the kept copy"
+
+step "database mode: a worktree without a checkout can still be torn down"
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[services.postgres]
+mode = "database"
+databases = ["app", "app_cache"]
+env = { DATABASE_URL = "postgres://app:app@127.0.0.1:{port}/{database}", CACHE_URL = "postgres://app:app@127.0.0.1:{port}/{database:app_cache}" }
+EOF
+"$WT" up db/orphan >/dev/null
+git worktree remove --force "$WORK/root/db-orphan" >/dev/null
+git worktree prune
+"$WT" ls >"$WORK/ls-orphan.log"
+awk -v s=db-orphan '$1==s {for(i=1;i<=NF;i++) if($i=="orphan") ok=1} END{exit !ok}' "$WORK/ls-orphan.log" || fail "ls orphan"
+"$WT" down db/orphan --yes >/dev/null
+[ "$(pg "select count(*) from pg_database where datname like 'wt_wte2e_db_orphan__%'")" = 0 ] || fail "orphan copies left"
+[ ! -e "$STATE_DIR/db-orphan.toml" ] || fail "orphan state left"
+
+step "database mode: ls reports shared, partial and no-db"
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[services.postgres]
+mode = "database"
+databases = ["app", "app_cache"]
+env = { DATABASE_URL = "postgres://app:app@127.0.0.1:{port}/{database}", CACHE_URL = "postgres://app:app@127.0.0.1:{port}/{database:app_cache}" }
+EOF
+"$WT" up db/ls1 >/dev/null
+for status in shared partial no-db; do
+  if [ "$status" = partial ]; then pg "drop database wt_wte2e_db_ls1__app_cache"; fi
+  if [ "$status" = no-db ]; then pg "drop database wt_wte2e_db_ls1__app"; fi
+  "$WT" ls >"$WORK/ls1.log"
+  awk -v s=db-ls1 -v st="$status" -v p="$HOST" \
+    '$1==s && $4==p {for(i=1;i<=NF;i++) if($i==st) ok=1} END{exit !ok}' "$WORK/ls1.log" ||
+    fail "ls did not report $status"
+done
+"$WT" down db/ls1 --yes >/dev/null
+
+step "database mode: ls says unknown and down keeps the state without Docker"
+mkdir -p "$WORK/fakebin"
+printf '#!/bin/sh\nexit 1\n' >"$WORK/fakebin/docker"
+chmod +x "$WORK/fakebin/docker"
+PATH="$WORK/fakebin:$PATH" "$WT" ls >"$WORK/ls-nodocker.log"
+awk -v s=db-keep '$1==s {for(i=1;i<=NF;i++) if($i=="unknown") ok=1} END{exit !ok}' "$WORK/ls-nodocker.log" || fail "ls unknown"
+PATH="$WORK/fakebin:$PATH" "$WT" down db/keep --yes --force >"$WORK/nodocker.log" 2>&1 || fail "down with no docker"
+grep -q 'Docker is not reachable; only the checkout will be removed' "$WORK/nodocker.log" || fail "wrong no-docker message"
+[ ! -e "$WORK/root/db-keep" ] || fail "checkout kept with no docker"
+[ "$(grep -c '^\[\[databases\]\]' "$STATE_DIR/db-keep.toml")" = 2 ] || fail "state dropped with no docker"
+PATH="$WORK/fakebin:$PATH" "$WT" down db/keep --yes >/dev/null 2>&1 || fail "second down with no docker"
+PATH="$WORK/fakebin:$PATH" "$WT" ls >"$WORK/ls-nodocker.log"
+awk -v s=db-keep '$1==s {for(i=1;i<=NF;i++) if($i=="orphan") ok=1} END{exit !ok}' "$WORK/ls-nodocker.log" || fail "orphan must win over unknown"
+"$WT" down db/keep --yes >/dev/null
+[ "$(pg "select count(*) from pg_database where datname like 'wt_wte2e_db_keep__%'")" = 0 ] || fail "copies left after the real down"
+
+step "database mode: down without a terminal and without --yes drops nothing"
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[services.postgres]
+mode = "database"
+databases = ["app", "app_cache"]
+env = { DATABASE_URL = "postgres://app:app@127.0.0.1:{port}/{database}", CACHE_URL = "postgres://app:app@127.0.0.1:{port}/{database:app_cache}" }
+EOF
+"$WT" up db/tty >/dev/null
+"$WT" down db/tty </dev/null 2>"$WORK/tty.log" && fail "down ran without a terminal"
+grep -q 'refusing to destroy db-tty without a terminal; pass --yes' "$WORK/tty.log" || fail "wrong no-tty error"
+[ "$(pg "select count(*) from pg_database where datname like 'wt_wte2e_db_tty__%'")" = 2 ] || fail "copies dropped without confirmation"
+[ -d "$WORK/root/db-tty" ] || fail "checkout dropped without confirmation"
+[ -e "$STATE_DIR/db-tty.toml" ] || fail "state dropped without confirmation"
+"$WT" down db/tty --yes >/dev/null
+
+step "database mode: two branches with the same slug"
+"$WT" up db/c >/dev/null
+"$WT" up db-c 2>"$WORK/slug.log" && fail "db-c reused db/c's worktree"
+grep -q 'same slug' "$WORK/slug.log" || fail "wrong slug collision error"
+[ "$(pg "select count(*) from pg_database where datname like 'wt_wte2e_db_c__%'")" = 2 ] || fail "the collision created copies"
+[ "$(git -C "$WORK/root/db-c" rev-parse --abbrev-ref HEAD)" = db/c ] || fail "db/c checkout changed"
+"$WT" down db/c --yes >/dev/null
+
+step "database mode: switching container -> database is refused until down"
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[services.postgres]
+database = "app"
+EOF
+"$WT" up db/legacy >/dev/null
+OLD_PORT="$(sed -n 's/^DB_PORT=//p' "$WORK/root/db-legacy/.env")"
+[ "$OLD_PORT" -ge 5433 ] && [ "$OLD_PORT" -le 5499 ] || fail "container clone outside the range"
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[services.postgres]
+mode = "database"
+databases = ["app"]
+env = { DATABASE_URL = "postgres://app:app@127.0.0.1:{port}/{database}" }
+EOF
+"$WT" up db/legacy 2>"$WORK/legacy.log" && fail "up migrated silently to database mode"
+grep -q 'is now mode = "database"' "$WORK/legacy.log" || fail "wrong forward mode-change error"
+grep -q 'wt down db-legacy' "$WORK/legacy.log" || fail "no down hint"
+[ "$(docker inspect -f '{{.State.Running}}' "$PROJECT-wt-db-legacy-postgres")" = true ] || fail "the leftover container was touched"
+[ "$(pg "select count(*) from pg_database where datname like 'wt_wte2e_db_legacy__%'")" = 0 ] || fail "copies created on the refusal"
+[ "$(sed -n 's/^postgres = //p' "$STATE_DIR/db-legacy.toml")" = "$OLD_PORT" ] || fail "state changed on the refusal"
+[ "$(grep -c '^\[\[databases\]\]' "$STATE_DIR/db-legacy.toml" || true)" = 0 ] || fail "state gained copies on the refusal"
+"$WT" down db/legacy --yes >/dev/null
+HOST="$(docker port "$PROJECT-postgres-1" 5432/tcp | sed 's/.*://')"
+"$WT" up db/legacy >/dev/null
+[ "$(pg "select count(*) from pg_database where datname like 'wt_wte2e_db_legacy__%'")" = 1 ] || fail "copy not created after down"
+grep -q "^DATABASE_URL=postgres://app:app@127.0.0.1:$HOST/wt_wte2e_db_legacy__app$" "$WORK/root/db-legacy/.env" || fail "database URL after the transition"
+"$WT" ls | awk -v s=db-legacy -v p="$HOST" '$1==s && $4==p {ok=1} END{exit !ok}' || fail "ls after the transition"
+"$WT" down db/legacy --yes >/dev/null
+
+step "database mode: a container wins over the database verdict in ls"
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[services.postgres]
+database = "app"
+EOF
+"$WT" up feat/prec >/dev/null
+PREC_PORT="$(sed -n 's/^DB_PORT=//p' "$WORK/root/feat-prec/.env")"
+cat >>"$STATE_DIR/feat-prec.toml" <<EOF
+
+[[databases]]
+service = "postgres"
+source = "$PROJECT-postgres-1"
+source_db = "app"
+target = "wt_wte2e_feat_prec__app"
+EOF
+"$WT" ls | awk -v s=feat-prec '$1==s {for(i=1;i<=NF;i++) if($i=="running") ok=1} END{exit !ok}' || fail "a container must win over the copy verdict"
+docker stop "$PROJECT-wt-feat-prec-postgres" >/dev/null
+"$WT" ls | awk -v s=feat-prec '$1==s {for(i=1;i<=NF;i++) if($i=="stopped") ok=1} END{exit !ok}' || fail "ls stopped"
+docker rm -f "$PROJECT-wt-feat-prec-postgres" >/dev/null
+"$WT" ls | awk -v s=feat-prec '$1==s {for(i=1;i<=NF;i++) if($i=="no-db") ok=1} END{exit !ok}' || fail "ls no-db after the container was removed"
+[ "$(sed -n 's/^postgres = //p' "$STATE_DIR/feat-prec.toml")" = "$PREC_PORT" ] || fail "port lost"
+"$WT" down feat/prec --yes >/dev/null
+
+step "database mode: switching database -> container is refused until down"
+HOST="$(docker port "$PROJECT-postgres-1" 5432/tcp | sed 's/.*://')"
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[services.postgres]
+mode = "database"
+databases = ["app", "app_cache"]
+env = { DATABASE_URL = "postgres://app:app@127.0.0.1:{port}/{database}", CACHE_URL = "postgres://app:app@127.0.0.1:{port}/{database:app_cache}" }
+EOF
+"$WT" up db/legacy2 >/dev/null
+cp "$STATE_DIR/db-legacy2.toml" "$WORK/state.before"
+[ "$(grep -c '^\[\[databases\]\]' "$STATE_DIR/db-legacy2.toml")" = 2 ] || fail "legacy2 state"
+[ "$(sed -n 's/^postgres = //p' "$STATE_DIR/db-legacy2.toml")" = "$HOST" ] || fail "legacy2 port"
+[ -z "$(docker ps -aq --filter 'name=wte2e-wt-db-legacy2-postgres')" ] || fail "database mode created a container"
+STARTED_AT="$(docker inspect -f '{{.State.StartedAt}}' "$PROJECT-postgres-1")"
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[services.postgres]
+database = "app"
+EOF
+"$WT" up db/legacy2 2>"$WORK/migrate.log" && fail "up migrated back to container silently"
+grep -qF 'is now mode = "container"' "$WORK/migrate.log" || fail "wrong reverse mode-change error"
+grep -qF '2 database copies' "$WORK/migrate.log" || fail "copy count missing"
+grep -qE 'wt_wte2e_db_legacy2__app.*wt_wte2e_db_legacy2__app_cache.*wt down db-legacy2' "$WORK/migrate.log" || fail "targets or hint missing"
+cmp -s "$WORK/state.before" "$STATE_DIR/db-legacy2.toml" || fail "state changed on the refusal"
+[ "$(pg "select count(*) from pg_database where datname like 'wt_wte2e_db_legacy2__%'")" = 2 ] || fail "copies dropped on the refusal"
+[ "$(docker inspect -f '{{.State.StartedAt}}' "$PROJECT-postgres-1")" = "$STARTED_AT" ] || fail "source touched on the refusal"
+git worktree remove --force "$WORK/root/db-legacy2" >/dev/null
+git worktree prune
+"$WT" up db/legacy2 2>>"$WORK/migrate.log" && fail "up recreated the worktree on the refusal"
+[ ! -d "$WORK/root/db-legacy2" ] || fail "worktree recreated on the refusal"
+"$WT" down db/legacy2 --yes >/dev/null
+[ "$(pg "select count(*) from pg_database where datname like 'wt_wte2e_db_legacy2__%'")" = 0 ] || fail "down did not drop the copies from the state"
+[ ! -e "$STATE_DIR/db-legacy2.toml" ] || fail "state left"
+git show-ref --verify --quiet refs/heads/db/legacy2 || fail "branch lost"
+"$WT" up db/legacy2 >/dev/null
+HOST="$(docker port "$PROJECT-postgres-1" 5432/tcp | sed 's/.*://')"
+NEW_PORT="$(docker port "$PROJECT-wt-db-legacy2-postgres" 5432/tcp | sed 's/.*://')"
+[ "$NEW_PORT" -ge 5433 ] && [ "$NEW_PORT" -le 5499 ] || fail "new container port outside the range"
+[ "$NEW_PORT" != "$HOST" ] || fail "the container took the source port"
+[ "$(sed -n 's/^DB_PORT=//p' "$WORK/root/db-legacy2/.env")" = "$NEW_PORT" ] || fail ".env has the wrong port"
+"$WT" ls | awk -v s=db-legacy2 -v p="$NEW_PORT" '$1==s && $4==p {ok=1} END{exit !ok}' || fail "ls after switching back"
+"$WT" down db/legacy2 --yes >/dev/null
+
+step "no database copy survived"
+[ -z "$(pg "select datname from pg_database where datname like 'wt_wte2e%'")" ] || fail "postgres copies left"
+[ -z "$(my "select schema_name from information_schema.schemata where schema_name like 'wt_wte2e%'")" ] || fail "mysql copies left"
+"$WT" ls | grep -q 'No worktree environments' || fail "ls not empty after database mode"
+
 step "wt up refuses a source with a mount inside its data dir"
 cat >.wt.toml <<EOF
 root = "$WORK/root"
@@ -271,7 +846,10 @@ if "$WT" up nested-test >"$WORK/nested.log" 2>&1; then
   fail "up accepted a source with a mount inside its data dir"
 fi
 grep -q 'inside its data dir' "$WORK/nested.log" || fail "wrong error for the nested mount"
-"$WT" down nested-test --yes >/dev/null
+grep -q 'mode = "database"' "$WORK/nested.log" || fail "the refusal does not suggest database mode"
+# The source is resolved before the checkout exists: a refused run leaves nothing.
+[ ! -e "$WORK/root/nested-test" ] || fail "a refused run created a worktree"
+[ ! -e "$XDG_STATE_HOME/wt/$PROJECT/nested-test.toml" ] || fail "a refused run wrote state"
 "$WT" ls | grep -q 'No worktree environments' || fail "nested-test left behind"
 
 step "legacy names and the slug label"
