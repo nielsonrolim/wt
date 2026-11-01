@@ -54,16 +54,8 @@ pub fn run() -> Result<()> {
                 kinds.push(kind);
             }
         }
-        rows.push((env, containers, volumes));
-    }
-
-    let mut header = vec!["SLUG", "BRANCH", "WEB"];
-    header.extend(kinds.iter().map(|k| k.name()));
-    header.extend(["STATUS", "DISK"]);
-    let mut table = vec![header.iter().map(|s| s.to_uppercase()).collect::<Vec<_>>()];
-
-    for (env, containers, volumes) in &rows {
         let state = State::load(&env.project, &env.slug);
+        // Copies whose service left the config still need their column.
         for copy in &state.databases {
             if let Some(kind) = Kind::from_name(&copy.service)
                 && !kinds.contains(&kind)
@@ -71,6 +63,15 @@ pub fn run() -> Result<()> {
                 kinds.push(kind);
             }
         }
+        rows.push((env, containers, volumes, state));
+    }
+
+    let mut header = vec!["SLUG", "BRANCH", "WEB"];
+    header.extend(kinds.iter().map(|k| k.name()));
+    header.extend(["STATUS", "DISK"]);
+    let mut table = vec![header.iter().map(|s| s.to_uppercase()).collect::<Vec<_>>()];
+
+    for (env, containers, volumes, state) in &rows {
         let mut row = vec![
             env.slug.clone(),
             git::current_branch(&env.path).unwrap_or_else(|| "-".into()),
@@ -85,17 +86,7 @@ pub fn run() -> Result<()> {
                 published.or(state.ports.get(kind.name()).copied()),
             ));
         }
-        row.push(
-            status(
-                &cfg,
-                env,
-                containers,
-                !volumes.is_empty(),
-                &state,
-                docker_ok,
-            )
-            .into(),
-        );
+        row.push(status(&cfg, env, containers, !volumes.is_empty(), state, docker_ok).into());
         let disk: Vec<&str> = volumes
             .iter()
             .filter_map(|v| sizes.get(&v.name).map(String::as_str))
@@ -185,9 +176,10 @@ fn database_status(state: &State) -> Option<&'static str> {
     }
     let mut existing = 0;
     for copy in &state.databases {
-        // A missing source container took its databases with it.
+        // The volume may outlive the container, so a missing source is
+        // "cannot tell", not "the copies are gone".
         let Some(container) = docker::container(&copy.source) else {
-            continue;
+            return Some("unknown");
         };
         if !container.state.running {
             return Some("unknown");

@@ -44,10 +44,17 @@ fn path(project: &str, slug: &str) -> PathBuf {
 
 impl State {
     pub fn load(project: &str, slug: &str) -> State {
-        fs::read_to_string(path(project, slug))
-            .ok()
-            .and_then(|t| toml::from_str(&t).ok())
-            .unwrap_or_default()
+        let file = path(project, slug);
+        let Ok(text) = fs::read_to_string(&file) else {
+            return State::default();
+        };
+        match toml::from_str(&text) {
+            Ok(state) => state,
+            Err(error) => {
+                eprintln!("warning: ignoring unreadable {}: {error}", file.display());
+                State::default()
+            }
+        }
     }
 
     pub fn save(&self, project: &str, slug: &str) -> Result<()> {

@@ -96,6 +96,8 @@ pub struct Ulimit {
 #[serde(rename_all = "PascalCase")]
 pub struct PortBinding {
     #[serde(default)]
+    pub host_ip: String,
+    #[serde(default)]
     pub host_port: String,
 }
 
@@ -146,17 +148,18 @@ impl Container {
     }
 
     /// The host port published for one container port, if any. The effective
-    /// `NetworkSettings` wins: an ephemeral host port lives only there.
+    /// `NetworkSettings` wins: an ephemeral host port lives only there. Only a
+    /// loopback-reachable binding counts, because the worktree connects to
+    /// `127.0.0.1`.
     pub fn host_port(&self, container_port: u16) -> Option<u16> {
         let key = format!("{container_port}/tcp");
         let read = |bindings: &HashMap<String, Option<Vec<PortBinding>>>| {
             bindings
                 .get(&key)?
                 .as_ref()?
-                .first()?
-                .host_port
-                .parse()
-                .ok()
+                .iter()
+                .find(|binding| matches!(binding.host_ip.as_str(), "" | "0.0.0.0" | "127.0.0.1"))
+                .and_then(|binding| binding.host_port.parse().ok())
         };
         self.network_settings
             .ports
@@ -366,13 +369,18 @@ pub fn exec(container: &str, argv: &[&str]) -> Result<String> {
     sh::output(docker().args(["exec", container]).args(argv))
 }
 
-/// `docker exec` with environment variables; used to hand MySQL its password
-/// without putting it on the command line.
+/// `docker exec` with environment variables. The value is set on the Docker
+/// client and passed as a bare `-e NAME`, so it does not appear in the argv
+/// (and therefore not in `ps` or an error message): the daemon copies it from
+/// the client's environment.
 pub fn exec_env(container: &str, env: &[(&str, &str)], argv: &[&str]) -> Result<String> {
     let mut cmd = docker();
     cmd.arg("exec");
-    for (k, v) in env {
-        cmd.arg("-e").arg(format!("{k}={v}"));
+    for (key, _) in env {
+        cmd.arg("-e").arg(key);
+    }
+    for (key, value) in env {
+        cmd.env(key, value);
     }
     sh::output(cmd.arg(container).args(argv))
 }
@@ -484,6 +492,11 @@ mod tests {
         assert_eq!(c[0].host_port(5432), Some(32779));
         assert_eq!(c[0].host_ports(), vec![32779]);
         assert_eq!(c[0].container_port(5432), Some(5432));
+
+        // A binding reachable only from another interface is not usable: the
+        // worktree connects to 127.0.0.1.
+        let c = with_bindings(r#"{"5432/tcp": [{"HostIp": "192.168.1.5", "HostPort": "5432"}]}"#);
+        assert_eq!(c.host_port(5432), None);
     }
 
     #[test]

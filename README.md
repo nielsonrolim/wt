@@ -51,7 +51,7 @@ Run it from the main checkout. If the branch exists, `wt` checks it out; otherwi
 Steps, in order:
 
 1. Creates the worktree at `<root>/<slug>`, through Herdr if it is available and with `git worktree add` otherwise. The slug is the branch name lowercased, with every other character turned into `-`, up to 40 characters: `feat/ENG-12_x` → `feat-eng-12-x`. A branch whose slug is already taken by another branch's worktree (`feat/x` and `feat-x`) is refused.
-2. Picks the ports: the web port and one per service, each from its own range. It skips ports published by any container (stopped ones included), ports already given to another worktree of any project, and ports something is listening on. A service in `mode = "database"` has no port of its own: it uses the source's published port.
+2. Picks the ports: the web port and one per service, each from its own range. It skips ports published by any container (stopped ones included), ports already given to another worktree of any project, and ports something is listening on. A service in `mode = "database"` has no port of its own: it uses the source's published port. Every source is resolved first, so a missing source, an unpublished (or non-loopback) port, a foreign database or a source-database typo aborts before the checkout and the state are created.
 3. Writes the worktree's `.env`, copied from the main checkout the first time, and `.envrc`.
 4. Copies the SQLite files and the `app.copy` paths, and refreshes the `app.refresh` paths.
 5. Runs `hooks.setup`.
@@ -70,7 +70,7 @@ Safeguards:
 - It refuses a checkout with uncommitted changes; `--force` overrides this.
 - It asks for confirmation, then about the branch. Without a terminal, it requires `--yes` (or `WT_YES=1`). Both answer with the default: keep the branch.
 - It offers the branch only when this worktree's own checkout is going away, and deletes it after the checkout is gone. A branch still checked out somewhere else — the main checkout included — is never touched.
-- If Docker is unreachable, or the source is stopped and you pass `--force`, the copied databases cannot be dropped: `down` removes the checkout but keeps the state file, so a later run can finish the job. A stopped source without `--force` stops `down` with an error. The source is never started for you.
+- If Docker is unreachable, or the source is stopped and you pass `--force`, or the source container is gone, the copied databases cannot be dropped: `down` removes the checkout but keeps the state file, so a later run can finish the job. A stopped source without `--force` stops `down` with an error. The source is never started for you.
 
 `--keep-checkout` removes the containers, volumes and copied databases; the worktree and its web port stay, so there is no branch to ask about.
 
@@ -91,10 +91,10 @@ feat-x  feat/x  3001  5433      6380   running  47.69MB+109B
 | `shared` | no container; every database copy registered in the state exists |
 | `no-db` | checkout without containers or database copies (`wt up <branch>` creates them) |
 | `ready` | project without services, checkout present |
-| `unknown` | Docker is unreachable, or a source instance is stopped, and the worktree has database copies, so `ls` cannot tell |
+| `unknown` | Docker is unreachable, or a source instance is stopped or gone, and the worktree has database copies, so `ls` cannot tell |
 | `orphan` | resources left behind, checkout gone (`wt down <slug>`) |
 
-`orphan` is decided from the filesystem and wins over `unknown`; a container of the worktree wins over the database verdict, and a stopped source reports `unknown` rather than `no-db`. `wt ls` never changes anything.
+`orphan` is decided from the filesystem and wins over `unknown`; a container of the worktree wins over the database verdict, and a stopped or missing source reports `unknown` rather than `no-db`. `wt ls` never changes anything.
 
 ### `wt init [--force]`
 
@@ -175,11 +175,11 @@ env = {
 - Ownership is the database itself: a Postgres copy carries `wt.project`, `wt.slug` and `wt.complete` in its database comment; a MySQL copy carries them in a `__wt_meta` table. A database without that marker is refused by `up` and by `down` (unless `--force`), and the source database is never dropped.
 - The copy is a dump written to a file inside the container and restored from it, so a failed dump cannot be mistaken for a finished copy. Postgres uses `pg_dump`/`psql`; MySQL uses `mysqldump`/`mysql` with `--single-transaction --routines --triggers --events` (`--set-gtid-purged=OFF` only on MySQL, not MariaDB), then grants the app user on the new database.
 - Re-runs reuse a finished copy. A half-copied database (marker `complete=0`) is dropped and copied again, and only that one.
-- `down` drops every copy recorded in the state, including one whose database left `databases` (`up` warns and keeps it). `--keep-checkout` drops the copies and keeps the checkout.
+- `down` drops every copy recorded in the state, including one whose database left `databases` (`up` warns and keeps it). `--keep-checkout` drops the copies and keeps the checkout. If the source container is gone, `down` keeps the state so a later run can drop the copies once the stack is back.
 - Changing a worktree's mode is refused, not migrated: `up` stops with an error and points at `wt down <slug>` when a container or volume of ours (going to database mode) or a registered copy (going back to container mode) is in the way.
-- The source must publish its port: the worktree connects to it at `127.0.0.1:<published port>`. An ephemeral host port changes when the container is recreated, so publish a fixed one if long-lived worktrees rely on it. A worktree keeps the port it recorded until the next `wt up`, which reads the new published port and rewrites the `.env`.
+- The source must publish its port on loopback: the worktree connects to it at `127.0.0.1:<published port>`. An ephemeral host port changes when the container is recreated, so publish a fixed one if long-lived worktrees rely on it. A worktree keeps the port it recorded until the next `wt up`, which reads the new published port and rewrites the `.env`.
 
-Limitations: the copies are independent, so references between databases (a MySQL view naming another schema, Postgres FDW or dblink) still point at the source. Roles are global to the instance. There is no clonefile: a logical copy uses real disk. MyISAM tables are not transactional, and concurrent DDL can wait for the dump.
+Limitations: the copies are independent, so references between databases (a MySQL view naming another schema, Postgres FDW or dblink) still point at the source. Roles are global to the instance. Postgres databases using the ICU or builtin locale provider are refused; `wt` copies only libc (`LC_COLLATE`/`LC_CTYPE`) databases. There is no clonefile: a logical copy uses real disk. MyISAM tables are not transactional, and concurrent DDL can wait for the dump.
 
 | | Postgres | MySQL/MariaDB | Redis/Valkey | SQLite |
 |---|---|---|---|---|

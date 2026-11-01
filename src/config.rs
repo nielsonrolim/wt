@@ -284,6 +284,9 @@ fn resolve(file: File, main_root: &Path, path: Option<PathBuf>) -> Result<Config
             bail!("services.{name}.databases requires mode = \"database\"");
         }
         for db in &databases {
+            if db.trim().is_empty() {
+                bail!("services.{name}.databases must not contain an empty database name");
+            }
             if db.contains('}') {
                 bail!("services.{name}.databases: database name {db:?} must not contain \"}}\"");
             }
@@ -400,9 +403,11 @@ fn check_env(
                             );
                         }
                         references_a_database = true;
-                    } else {
+                    } else if token.starts_with("database") {
                         bail!("services.{name}.env has unknown placeholder {{{token}}}");
                     }
+                    // Other braces are literal (Helm templates, JSON) and are
+                    // left untouched, as they were before database mode.
                 }
             }
         }
@@ -742,6 +747,15 @@ mod tests {
         assert!(load("[services.sqlite]").is_err());
         let cfg = load("[services.sqlite]\nfiles = [\"storage/dev.sqlite3\"]").unwrap();
         assert_eq!(cfg.sqlite.unwrap().files.len(), 1);
+    }
+
+    #[test]
+    fn other_braces_are_literal() {
+        let cfg = load("[services.postgres]\nenv = { U = \"{{.Values.url}}\" }").unwrap();
+        assert_eq!(
+            cfg.service(Kind::Postgres).unwrap().env["U"],
+            "{{.Values.url}}"
+        );
     }
 
     #[test]

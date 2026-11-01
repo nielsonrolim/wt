@@ -130,6 +130,7 @@ docker compose exec -T redis sh -c 'redis-cli set marker cloned >/dev/null && re
 docker compose exec -T mariadb mariadb -uroot -papp app -e "create table marker(v text); insert into marker values ('cloned');" >/dev/null
 docker compose exec -T mariadb mariadb -uroot -papp -e "create database app_aux character set utf8mb4 collate utf8mb4_bin" >/dev/null
 docker compose exec -T mariadb mariadb -uroot -papp app_aux -e "create table marker(v text); insert into marker values ('aux');" >/dev/null
+docker compose exec -T mariadb mariadb -uroot -papp app_aux -e "create table __wt_meta(k varchar(64), v varchar(255)); insert into __wt_meta values ('noise','x');" >/dev/null
 docker compose exec -T mariadb mariadb -uroot -papp app -e "create procedure proc() select 1; create trigger trg before insert on marker for each row set new.v = new.v;" >/dev/null
 sqlite3 storage/development.sqlite3 "create table marker(v text); insert into marker values ('cloned');"
 mkdir -p storage/ab && echo blob >storage/ab/blob
@@ -475,6 +476,20 @@ docker start "$PROJECT-postgres-1" >/dev/null
 # An ephemeral published port can change across a stop/start.
 HOST="$(docker port "$PROJECT-postgres-1" 5432/tcp | sed 's/.*://')"
 
+step "database mode: a typo in databases leaves no worktree or state"
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[services.postgres]
+mode = "database"
+databases = ["nope"]
+env = { DATABASE_URL = "postgres://app:app@127.0.0.1:{port}/{database}" }
+EOF
+if "$WT" up db/typo >"$WORK/typo.log" 2>&1; then fail "up accepted a missing source database"; fi
+grep -q 'source database nope not found' "$WORK/typo.log" || fail "wrong missing-source error"
+[ ! -e "$WORK/root/db-typo" ] || fail "worktree created for a missing source database"
+[ ! -e "$STATE_DIR/db-typo.toml" ] || fail "state written for a missing source database"
+
 step "database mode: redis is refused by the config"
 cat >.wt.toml <<EOF
 root = "$WORK/root"
@@ -522,6 +537,7 @@ DBM="$WORK/root/db-mysql"
 [ "$(sed -n 's/^DB_PORT=//p' "$DBM/.env")" = "$MYSQL_HOST" ] || fail "mysql port is not the source port"
 [ "$(my "select count(*) from information_schema.schemata where schema_name like 'wt_wte2e_db_mysql__%'")" = 2 ] || fail "expected two mysql copies"
 [ "$(my "select v from __wt_meta where k='wt.complete'" wt_wte2e_db_mysql__app)" = 1 ] || fail "mysql marker"
+[ "$(my "select count(*) from __wt_meta where k='noise'" wt_wte2e_db_mysql__app_aux)" = 0 ] || fail "a source __wt_meta table leaked into the marker"
 [ "$(my "select count(*) from marker" wt_wte2e_db_mysql__app)" = "$(my "select count(*) from marker" app)" ] || fail "mysql app data"
 [ "$(my "select count(*) from marker" wt_wte2e_db_mysql__app_aux)" = "$(my "select count(*) from marker" app_aux)" ] || fail "mysql aux data"
 AUX_CS="$(my "select default_character_set_name, default_collation_name from information_schema.schemata where schema_name='app_aux'")"
@@ -570,6 +586,12 @@ sed -i 's/^target = .*/target = "app"/' "$STATE_DIR/db-look2.toml"
 grep -q 'refusing to drop app' "$WORK/look2.log" || fail "wrong source guard error"
 [ "$(pg "select count(*) from pg_database where datname='app'")" = 1 ] || fail "source database dropped"
 [ "$(pg_of app 'select v from marker')" = cloned ] || fail "source data lost"
+# Even when source_db is rewritten, a target that names a configured source is
+# never dropped.
+sed -i 's/^source_db = .*/source_db = "other"/' "$STATE_DIR/db-look2.toml"
+"$WT" down db/look2 --yes --force 2>"$WORK/look2b.log" && fail "down dropped a configured source database"
+grep -q 'refusing to drop app' "$WORK/look2b.log" || fail "protected source guard missing"
+sed -i 's/^source_db = "other"/source_db = "app"/' "$STATE_DIR/db-look2.toml"
 sed -i 's/^target = "app"/target = "wt_wte2e_db_look2__app"/' "$STATE_DIR/db-look2.toml"
 "$WT" up db/look2 >/dev/null
 "$WT" down db/look2 --yes >/dev/null
@@ -684,6 +706,20 @@ for status in shared partial no-db; do
     fail "ls did not report $status"
 done
 "$WT" down db/ls1 --yes >/dev/null
+
+step "database mode: ls keeps its columns when the service left the config"
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[services.postgres]
+mode = "database"
+databases = ["app", "app_cache"]
+env = { DATABASE_URL = "postgres://app:app@127.0.0.1:{port}/{database}", CACHE_URL = "postgres://app:app@127.0.0.1:{port}/{database:app_cache}" }
+EOF
+"$WT" up db/nosvc >/dev/null
+printf 'root = "%s"\n' "$WORK/root" >.wt.toml
+"$WT" ls | awk -v s=db-nosvc -v p="$HOST" '$1==s && $4==p {ok=1} END{exit !ok}' || fail "ls columns broke when the service left the config"
+"$WT" down db/nosvc --yes >/dev/null
 
 step "database mode: ls says unknown while the source is stopped"
 cat >.wt.toml <<EOF
@@ -901,3 +937,23 @@ if "$WT" down bare --yes >"$WORK/bare.log" 2>&1; then
 fi
 grep -q 'not labelled' "$WORK/bare.log" || fail "wrong error for the unlabelled volume"
 docker volume rm "$PROJECT-wt-bare-db" >/dev/null
+
+step "database mode: down keeps the state when the source container is gone"
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[services.postgres]
+mode = "database"
+databases = ["app", "app_cache"]
+env = { DATABASE_URL = "postgres://app:app@127.0.0.1:{port}/{database}", CACHE_URL = "postgres://app:app@127.0.0.1:{port}/{database:app_cache}" }
+EOF
+"$WT" up db/gone >/dev/null
+# Remove the container but keep its volume: the copies come back with it.
+docker compose rm -sf postgres >/dev/null
+"$WT" down db/gone --yes >"$WORK/gone.log" 2>&1 || fail "down failed with a gone source"
+grep -q 'is gone' "$WORK/gone.log" || fail "down did not say the source is gone"
+[ "$(grep -c '^\[\[databases\]\]' "$STATE_DIR/db-gone.toml")" = 2 ] || fail "state dropped with a gone source"
+[ ! -e "$WORK/root/db-gone" ] || fail "checkout kept with a gone source"
+docker compose up -d --wait postgres >/dev/null 2>&1
+"$WT" down db/gone --yes >/dev/null
+[ "$(pg "select count(*) from pg_database where datname like 'wt_wte2e_db_gone__%'")" = 0 ] || fail "copies left after the source returned"
