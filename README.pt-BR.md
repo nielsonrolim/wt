@@ -51,7 +51,7 @@ Roda do checkout principal. Um branch existente é feito checkout; um desconheci
 Passos, nesta ordem:
 
 1. Cria a worktree em `<root>/<slug>` (via Herdr, se disponível; senão `git worktree add`). O slug é o branch em minúsculas, com qualquer outro caractere virando `-`, até 40 caracteres: `feat/ENG-12_x` → `feat-eng-12-x`. Um branch cujo slug já pertence à worktree de outro branch (`feat/x` e `feat-x`) é recusado.
-2. Escolhe as portas: a porta web e uma por serviço, cada uma na sua faixa, pulando as que algum container (mesmo parado) publica, as que outra worktree de qualquer projeto já recebeu e as que têm algo escutando. Um serviço em `mode = "database"` não tem porta própria: usa a porta publicada da origem.
+2. Escolhe as portas: a porta web e uma por serviço, cada uma na sua faixa, pulando as que algum container (mesmo parado) publica, as que outra worktree de qualquer projeto já recebeu e as que têm algo escutando. Um serviço em `mode = "database"` não tem porta própria: usa a porta publicada da origem. Toda origem é resolvida antes, então origem ausente, porta não publicada (ou fora do loopback), banco estranho ou nome de banco de origem errado abortam antes do checkout e do estado.
 3. Escreve o `.env` da worktree (copiado do principal na primeira vez) e o `.envrc`.
 4. Copia os arquivos SQLite e os caminhos de `app.copy`, e atualiza os de `app.refresh`.
 5. Roda `hooks.setup`.
@@ -70,7 +70,7 @@ Proteções:
 - Recusa um checkout com mudanças não commitadas (`--force` passa por cima).
 - Pede confirmação e, depois, sobre o branch. Sem terminal, exige `--yes` (ou `WT_YES=1`), que responde tudo com o padrão: mantém o branch.
 - Só oferece o branch quando o checkout desta worktree vai embora, e o apaga depois que o checkout sumiu. Um branch ainda em checkout em outro lugar — o principal incluído — nunca é tocado.
-- Se o Docker estiver inalcançável, ou a origem parada e você passar `--force`, os bancos copiados não podem ser dropados: o `down` remove o checkout mas mantém o arquivo de estado, para uma execução posterior terminar o serviço. Uma origem parada sem `--force` faz o `down` parar com erro. O `wt` nunca inicia a origem.
+- Se o Docker estiver inalcançável, ou a origem parada e você passar `--force`, ou o container de origem tiver sumido, os bancos copiados não podem ser dropados: o `down` remove o checkout mas mantém o arquivo de estado, para uma execução posterior terminar o serviço. Uma origem parada sem `--force` faz o `down` parar com erro. O `wt` nunca inicia a origem.
 
 `--keep-checkout` remove os containers, volumes e bancos copiados; a worktree e a porta web ficam, então não há branch sobre o que perguntar.
 
@@ -91,10 +91,10 @@ feat-x  feat/x  3001  5433      6380   running  47.69MB+109B
 | `shared` | sem container; todos os bancos copiados registrados no estado existem |
 | `no-db` | checkout sem containers nem bancos copiados (`wt up <branch>` cria) |
 | `ready` | projeto sem serviços, checkout presente |
-| `unknown` | Docker inalcançável, ou uma instância de origem parada, e a worktree tem bancos copiados, então o `ls` não sabe dizer |
+| `unknown` | Docker inalcançável, ou uma instância de origem parada ou ausente, e a worktree tem bancos copiados, então o `ls` não sabe dizer |
 | `orphan` | sobraram recursos, mas o checkout sumiu (`wt down <slug>`) |
 
-`orphan` vem do sistema de arquivos e vence `unknown`; um container da worktree vence o veredito de banco, e uma origem parada reporta `unknown` em vez de `no-db`. O `wt ls` nunca muda nada.
+`orphan` vem do sistema de arquivos e vence `unknown`; um container da worktree vence o veredito de banco, e uma origem parada ou ausente reporta `unknown` em vez de `no-db`. O `wt ls` nunca muda nada.
 
 ### `wt init [--force]`
 
@@ -167,11 +167,11 @@ env = {
 - A posse é o próprio banco: uma cópia no Postgres carrega `wt.project`, `wt.slug` e `wt.complete` no comentário do banco; uma cópia no MySQL carrega isso numa tabela `__wt_meta`. Banco sem esse marcador é recusado pelo `up` e pelo `down` (a menos que `--force`), e o banco de origem nunca é dropado.
 - A cópia é um dump escrito num arquivo dentro do container e restaurado dele, então um dump que falhou não se confunde com uma cópia pronta. Postgres usa `pg_dump`/`psql`; MySQL usa `mysqldump`/`mysql` com `--single-transaction --routines --triggers --events` (`--set-gtid-purged=OFF` só no MySQL, não no MariaDB), e concede o usuário da app no banco novo.
 - Re-runs reaproveitam uma cópia pronta. Um banco copiado pela metade (marcador `complete=0`) é dropado e copiado de novo, e só ele.
-- O `down` dropa todas as cópias registradas no estado, incluindo a de um banco que saiu de `databases` (o `up` avisa e mantém). `--keep-checkout` dropa as cópias e mantém o checkout.
+- O `down` dropa todas as cópias registradas no estado, incluindo a de um banco que saiu de `databases` (o `up` avisa e mantém). `--keep-checkout` dropa as cópias e mantém o checkout. Se o container de origem sumiu, o `down` mantém o estado para uma execução posterior dropar as cópias quando o stack voltar.
 - Trocar o modo de uma worktree é recusado, não migrado: o `up` para com erro e aponta `wt down <slug>` quando um container ou volume nosso (indo para o modo database) ou uma cópia registrada (voltando para container) está no caminho.
-- A origem precisa publicar a porta: a worktree conecta em `127.0.0.1:<porta publicada>`. Uma porta de host efêmera muda quando o container é recriado; publique uma fixa se worktrees duradouras dependerem dela. Uma worktree mantém a porta registrada até o próximo `wt up`, que lê a nova porta publicada e reescreve o `.env`.
+- A origem precisa publicar a porta no loopback: a worktree conecta em `127.0.0.1:<porta publicada>`. Uma porta de host efêmera muda quando o container é recriado; publique uma fixa se worktrees duradouras dependerem dela. Uma worktree mantém a porta registrada até o próximo `wt up`, que lê a nova porta publicada e reescreve o `.env`.
 
-Limitações: as cópias são independentes, então referências entre bancos (uma view MySQL citando outro schema, FDW ou dblink no Postgres) continuam apontando para a origem. Roles são globais na instância. Não há clonefile: uma cópia lógica ocupa disco de verdade. Tabelas MyISAM não são transacionais, e DDL concorrente pode esperar o dump.
+Limitações: as cópias são independentes, então referências entre bancos (uma view MySQL citando outro schema, FDW ou dblink no Postgres) continuam apontando para a origem. Roles são globais na instância. Bancos Postgres com locale provider ICU ou builtin são recusados; o `wt` copia só bancos libc (`LC_COLLATE`/`LC_CTYPE`). Não há clonefile: uma cópia lógica ocupa disco de verdade. Tabelas MyISAM não são transacionais, e DDL concorrente pode esperar o dump.
 
 | | Postgres | MySQL/MariaDB | Redis/Valkey | SQLite |
 |---|---|---|---|---|

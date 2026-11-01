@@ -61,7 +61,7 @@ enum Command {
     /// STATUS: running (all containers up), partial, stopped, shared (no
     /// container; every copied database exists), no-db (checkout without
     /// containers or copies), ready (project without services), unknown
-    /// (Docker unreachable or a source stopped, with copies), orphan
+    /// (Docker unreachable, or a source stopped or gone, with copies), orphan
     /// (resources left behind, checkout gone: wt down <slug>).
     #[command(visible_alias = "list")]
     Ls,

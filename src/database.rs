@@ -73,11 +73,15 @@ fn shorten(text: &str, budget: usize) -> String {
 }
 
 /// The target for every source database, refusing two names that sanitize to
-/// the same target.
+/// the same target, a name with no usable characters, and a target that is
+/// itself one of the sources.
 pub fn targets(project: &str, slug: &str, databases: &[String]) -> Result<Vec<(String, String)>> {
     let mut out = Vec::new();
     let mut seen: BTreeMap<String, String> = BTreeMap::new();
     for database in databases {
+        if sanitize(database).is_empty() {
+            bail!("database name {database:?} has no characters usable in a target");
+        }
         let target = target_name(project, slug, database);
         check_not_self(database, &target)?;
         if let Some(other) = seen.get(&target) {
@@ -85,6 +89,12 @@ pub fn targets(project: &str, slug: &str, databases: &[String]) -> Result<Vec<(S
         }
         seen.insert(target.clone(), database.clone());
         out.push((database.clone(), target));
+    }
+    let sources: BTreeSet<&str> = databases.iter().map(String::as_str).collect();
+    for (source, target) in &out {
+        if sources.contains(target.as_str()) {
+            bail!("target {target} for {source:?} is also a source database; choose another name");
+        }
     }
     Ok(out)
 }
@@ -202,6 +212,12 @@ fn sql_lit(text: &str) -> String {
     format!("'{}'", text.replace('\'', "''"))
 }
 
+/// MySQL treats backslash as an escape inside a single-quoted string, unlike
+/// Postgres.
+fn mysql_lit(text: &str) -> String {
+    format!("'{}'", text.replace('\\', "\\\\").replace('\'', "''"))
+}
+
 fn sql_ident(text: &str) -> String {
     format!("\"{}\"", text.replace('"', "\"\""))
 }
@@ -210,12 +226,19 @@ fn sql_backtick(text: &str) -> String {
     format!("`{}`", text.replace('`', "``"))
 }
 
+/// One dump path per target: two worktrees brought up at the same time from
+/// the same source container must not share a temporary file.
+fn dump_file(target: &str) -> String {
+    format!("{DUMP_FILE}-{}", sanitize(target))
+}
+
 /// Dump to a file and restore from it, so `set -e` sees the dump's exit code.
 /// No pipe and no `set -o pipefail`: the shell inside the image may not have it,
 /// and a failed dump would otherwise still report success.
 pub fn pg_copy_script(origin: &str, target: &str, user: &str) -> String {
+    let file = dump_file(target);
     format!(
-        "f={DUMP_FILE}\ntrap 'rm -f {DUMP_FILE}' 0 1 2 15\npg_dump -U {user} -d {origin} > \"$f\" && psql -v ON_ERROR_STOP=1 -U {user} -d {target} < \"$f\"",
+        "f={file}\ntrap 'rm -f {file}' 0 1 2 15\npg_dump -U {user} -d {origin} > \"$f\" && psql -v ON_ERROR_STOP=1 -U {user} -d {target} < \"$f\"",
         user = shell_quote(user),
         origin = shell_quote(origin),
         target = shell_quote(target),
@@ -243,8 +266,9 @@ pub fn mysql_dump_args(version: &str) -> Vec<String> {
 
 pub fn mysql_copy_script(origin: &str, target: &str, version: &str) -> String {
     let args = mysql_dump_args(version).join(" ");
+    let file = dump_file(target);
     format!(
-        "f={DUMP_FILE}\ntrap 'rm -f {DUMP_FILE}' 0 1 2 15\ndump=$(command -v mysqldump || command -v mariadb-dump)\ncli=$(command -v mysql || command -v mariadb)\n\"$dump\" {args} {origin} > \"$f\" && \"$cli\" {target} < \"$f\"",
+        "f={file}\ntrap 'rm -f {file}' 0 1 2 15\ndump=$(command -v mysqldump || command -v mariadb-dump)\ncli=$(command -v mysql || command -v mariadb)\n\"$dump\" {args} {origin} > \"$f\" && \"$cli\" {target} < \"$f\"",
         origin = shell_quote(origin),
         target = shell_quote(target),
     )
@@ -296,16 +320,31 @@ pub fn reconcile(previous: &[DatabaseCopy], desired: &[(DatabaseCopy, MarkerStat
             MarkerState::Foreign => {}
         }
     }
-    let wanted: BTreeSet<(&str, &str)> = desired
+    let wanted: BTreeSet<(&str, &str, &str)> = desired
         .iter()
-        .map(|(copy, _)| (copy.service.as_str(), copy.target.as_str()))
+        .map(|(copy, _)| {
+            (
+                copy.service.as_str(),
+                copy.source.as_str(),
+                copy.target.as_str(),
+            )
+        })
         .collect();
     let mut seen = BTreeSet::new();
     for copy in previous {
-        if wanted.contains(&(copy.service.as_str(), copy.target.as_str())) {
+        let key = (
+            copy.service.as_str(),
+            copy.source.as_str(),
+            copy.target.as_str(),
+        );
+        if wanted.contains(&key) {
             continue;
         }
-        if seen.insert((copy.service.clone(), copy.target.clone())) {
+        if seen.insert((
+            copy.service.clone(),
+            copy.source.clone(),
+            copy.target.clone(),
+        )) {
             out.keep.push(copy.clone());
         }
     }
@@ -336,9 +375,18 @@ fn mysql_env(container: &Container) -> Vec<(&str, &str)> {
         .unwrap_or_default()
 }
 
+fn pg_env(container: &Container) -> Vec<(&str, &str)> {
+    container
+        .env_value("POSTGRES_PASSWORD")
+        .filter(|password| !password.is_empty())
+        .map(|password| vec![("PGPASSWORD", password)])
+        .unwrap_or_default()
+}
+
 fn pg_query(container: &Container, user: &str, database: &str, sql: &str) -> Result<String> {
-    docker::exec(
+    docker::exec_env(
         container.name(),
+        &pg_env(container),
         &[
             "psql",
             "-qtAX",
@@ -420,7 +468,7 @@ fn pg_state(container: &Container, target: &str, project: &str, slug: &str) -> R
 fn mysql_exists(container: &Container, database: &str) -> Result<bool> {
     let sql = format!(
         "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = {}",
-        sql_lit(database)
+        mysql_lit(database)
     );
     Ok(mysql_query(container, "information_schema", &sql)?.trim() == "1")
 }
@@ -430,7 +478,7 @@ fn mysql_exists(container: &Container, database: &str) -> Result<bool> {
 fn mysql_metadata(container: &Container, source: &str) -> Result<(String, String)> {
     let sql = format!(
         "SELECT default_character_set_name, default_collation_name FROM information_schema.schemata WHERE schema_name = {}",
-        sql_lit(source)
+        mysql_lit(source)
     );
     let out = mysql_query(container, "information_schema", &sql)?;
     let line = out.trim_end_matches(['\n', '\r']);
@@ -446,7 +494,7 @@ fn mysql_metadata(container: &Container, source: &str) -> Result<(String, String
 fn mysql_rows(container: &Container, database: &str) -> Result<Option<BTreeMap<String, String>>> {
     let sql = format!(
         "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = {} AND table_name = '__wt_meta'",
-        sql_lit(database)
+        mysql_lit(database)
     );
     if mysql_query(container, "information_schema", &sql)?.trim() != "1" {
         return Ok(None);
@@ -569,6 +617,17 @@ pub fn plan(
     let targets = targets(&env.project, &env.slug, &databases)?;
     let mut out = Vec::new();
     for (source_db, target) in targets {
+        // A typo or a renamed source must fail here, before the checkout and
+        // the state exist, not inside the copy after both were written.
+        match svc.kind {
+            crate::services::Kind::Postgres => {
+                pg_metadata(&src.container, pg_user(&src.container), &source_db)?;
+            }
+            crate::services::Kind::Mysql => {
+                mysql_metadata(&src.container, &source_db)?;
+            }
+            crate::services::Kind::Redis => unreachable!(),
+        }
         let state = match svc.kind {
             crate::services::Kind::Postgres => {
                 pg_state(&src.container, &target, &env.project, &env.slug)?
@@ -580,9 +639,8 @@ pub fn plan(
         };
         if state == MarkerState::Foreign {
             bail!(
-                "{target} was not created by wt for {}/{} (wt down {} --force drops it, or drop it by hand)",
+                "{target} was not created by wt for {}/{}; drop it by hand before retrying",
                 env.project,
-                env.slug,
                 env.slug
             );
         }
@@ -609,7 +667,14 @@ pub fn prepare(
 ) -> Result<()> {
     for (copy, state) in planned {
         match state {
-            MarkerState::Reuse => println!("Reusing {}", copy.target),
+            MarkerState::Reuse => {
+                // Idempotent: repairs a grant that failed after the copy was
+                // finished, and keeps the app user able to reach the copy.
+                if svc.kind == crate::services::Kind::Mysql {
+                    grant_mysql(&src.container, &copy.target)?;
+                }
+                println!("Reusing {}", copy.target);
+            }
             MarkerState::Recreate => {
                 println!("Recreating {}", copy.target);
                 drop_copy(copy, &src.container)?;
@@ -656,8 +721,12 @@ fn create_postgres(
     mark_complete(container, copy, env, false)?;
     if svc.clone {
         let script = pg_copy_script(&copy.source_db, &copy.target, user);
-        docker::exec(container.name(), &["sh", "-euc", &script])
-            .with_context(|| format!("copying {} into {}", copy.source_db, copy.target))?;
+        docker::exec_env(
+            container.name(),
+            &pg_env(container),
+            &["sh", "-euc", &script],
+        )
+        .with_context(|| format!("copying {} into {}", copy.source_db, copy.target))?;
     }
     mark_complete(container, copy, env, true)?;
     println!(
@@ -674,11 +743,37 @@ fn pg_metadata(
     user: &str,
     source: &str,
 ) -> Result<(String, String, String, String)> {
-    let sql = format!(
+    // `datlocprovider` exists from Postgres 15. ICU and builtin databases do
+    // not accept plain LC_COLLATE/LC_CTYPE on CREATE DATABASE, so refuse them
+    // instead of failing after a Recreate has already dropped the copy.
+    let modern = format!(
+        "SELECT pg_get_userbyid(datdba), pg_encoding_to_char(encoding), datcollate, datctype, datlocprovider FROM pg_database WHERE datname = {}",
+        sql_lit(source)
+    );
+    if let Ok(out) = pg_query(container, user, "postgres", &modern) {
+        let line = out.trim_end_matches(['\n', '\r']);
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() == 5 {
+            if fields[4] != "c" {
+                bail!(
+                    "source database {source} uses locale provider {:?}; wt copies only libc (LC_COLLATE/LC_CTYPE) databases",
+                    fields[4]
+                );
+            }
+            return Ok((
+                fields[0].to_string(),
+                fields[1].to_string(),
+                fields[2].to_string(),
+                fields[3].to_string(),
+            ));
+        }
+    }
+    let legacy = format!(
         "SELECT pg_get_userbyid(datdba), pg_encoding_to_char(encoding), datcollate, datctype FROM pg_database WHERE datname = {}",
         sql_lit(source)
     );
-    let out = pg_query(container, user, "postgres", &sql)?;
+    let out = pg_query(container, user, "postgres", &legacy)
+        .with_context(|| format!("could not read {source} from {}", container.name()))?;
     let line = out.trim_end_matches(['\n', '\r']);
     let fields: Vec<&str> = line.split('\t').collect();
     if fields.len() != 4 {
@@ -708,20 +803,7 @@ fn create_mysql(
         container,
         &format!("CREATE DATABASE {target} CHARACTER SET {charset} COLLATE {collation}"),
     )?;
-    mysql_exec(
-        container,
-        &format!(
-            "CREATE TABLE {target}.__wt_meta (k VARCHAR(64) PRIMARY KEY, v VARCHAR(255) NOT NULL)"
-        ),
-    )?;
-    mysql_exec(
-        container,
-        &format!(
-            "INSERT INTO {target}.__wt_meta (k, v) VALUES ('wt.project', {}), ('wt.slug', {}), ('wt.complete', '0')",
-            sql_lit(&env.project),
-            sql_lit(&env.slug)
-        ),
-    )?;
+    mysql_marker(container, env, copy, false)?;
     if svc.clone {
         let version = mysql_version(container)?;
         let script = mysql_copy_script(&copy.source_db, &copy.target, &version);
@@ -732,10 +814,9 @@ fn create_mysql(
         )
         .with_context(|| format!("copying {} into {}", copy.source_db, copy.target))?;
     }
-    mysql_exec(
-        container,
-        &format!("UPDATE {target}.__wt_meta SET v = '1' WHERE k = 'wt.complete'"),
-    )?;
+    // Rewritten after the restore: a source `__wt_meta` table would come with
+    // the dump and replace the marker created above.
+    mysql_marker(container, env, copy, true)?;
     grant_mysql(container, &copy.target)?;
     println!(
         "{} {} into {}",
@@ -744,6 +825,35 @@ fn create_mysql(
         copy.target
     );
     Ok(())
+}
+
+/// Writes (or rewrites) the MySQL ownership marker. `__wt_meta` is reserved.
+fn mysql_marker(
+    container: &Container,
+    env: &Env,
+    copy: &DatabaseCopy,
+    complete: bool,
+) -> Result<()> {
+    let target = sql_backtick(&copy.target);
+    mysql_exec(
+        container,
+        &format!("DROP TABLE IF EXISTS {target}.__wt_meta"),
+    )?;
+    mysql_exec(
+        container,
+        &format!(
+            "CREATE TABLE {target}.__wt_meta (k VARCHAR(64) PRIMARY KEY, v VARCHAR(255) NOT NULL)"
+        ),
+    )?;
+    mysql_exec(
+        container,
+        &format!(
+            "INSERT INTO {target}.__wt_meta (k, v) VALUES ('wt.project', {}), ('wt.slug', {}), ('wt.complete', {})",
+            mysql_lit(&env.project),
+            mysql_lit(&env.slug),
+            mysql_lit(if complete { "1" } else { "0" })
+        ),
+    )
 }
 
 fn grant_mysql(container: &Container, target: &str) -> Result<()> {
@@ -757,7 +867,7 @@ fn grant_mysql(container: &Container, target: &str) -> Result<()> {
         &format!(
             "GRANT ALL PRIVILEGES ON {}.* TO {}@'%'",
             sql_backtick(target),
-            sql_lit(user)
+            mysql_lit(user)
         ),
     )
 }
@@ -836,21 +946,32 @@ pub fn verify(svc: &Service, src: &ContainerSource, target: &str) -> Result<()> 
 
 /// Drops the copies the state records, with the source container in hand.
 /// Returns false when it had to leave the state alone (Docker down, source
-/// stopped under --force), so the caller can keep the registry for later.
-pub fn drop_all(copies: &[DatabaseCopy], env: &Env, force: bool) -> Result<bool> {
+/// stopped or gone), so the caller can keep the registry for later.
+pub fn drop_all(
+    copies: &[DatabaseCopy],
+    env: &Env,
+    force: bool,
+    protected: &BTreeSet<String>,
+) -> Result<bool> {
     if copies.is_empty() {
         return Ok(true);
     }
     for copy in copies {
-        if copy.source_db == copy.target {
+        // A tampered state must never make `down` drop a source database.
+        if copy.source_db == copy.target
+            || protected.contains(&copy.target)
+            || copies.iter().any(|other| other.source_db == copy.target)
+        {
             bail!(
                 "refusing to drop {}: it is the source database",
-                copy.source_db
+                copy.target
             );
         }
+        // A container that is gone may come back with its volume, and the
+        // copies with it; keep the registry so a later run can finish.
         let Some(container) = docker::container(&copy.source) else {
-            println!("Skipping {}: {} is gone", copy.target, copy.source);
-            continue;
+            println!("Keeping {}: {} is gone", copy.target, copy.source);
+            return Ok(false);
         };
         if !container.state.running {
             if !force {
@@ -1073,6 +1194,37 @@ mod tests {
                 ("C".to_string(), "pg://h:5432/wt_p_s__cache".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn refuses_names_without_usable_characters() {
+        assert!(targets("p", "s", &["日本".to_string()]).is_err());
+        assert!(targets("p", "s", &[String::new()]).is_err());
+    }
+
+    #[test]
+    fn refuses_a_target_that_is_another_source() {
+        let err = format!(
+            "{:#}",
+            targets("p", "s", &["app".to_string(), "wt_p_s__app".to_string()]).unwrap_err()
+        );
+        assert!(err.contains("also a source database"), "{err}");
+    }
+
+    #[test]
+    fn changing_the_source_keeps_the_old_copy() {
+        let old = DatabaseCopy {
+            service: "postgres".into(),
+            source: "old".into(),
+            source_db: "app".into(),
+            target: "wt_p_s__app".into(),
+        };
+        let new = DatabaseCopy {
+            source: "new".into(),
+            ..old.clone()
+        };
+        let reconciled = reconcile(std::slice::from_ref(&old), &[(new, MarkerState::Reuse)]);
+        assert_eq!(reconciled.keep, vec![old]);
     }
 
     #[test]

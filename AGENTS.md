@@ -23,7 +23,7 @@ A CLI that gives each git worktree its own development databases and web port. A
 - Targets are `wt_<project>_<slug>__<source>`: sanitized, at most 63 bytes, order-independent, hash-suffixed on truncation, and refused when two sources collide. A target is never the source.
 - The dump is written to a file inside the container and restored from it (`pg_dump > file && psql < file`, `mysqldump > file && mysql < file`), with a `trap` cleanup. Never a pipe between dump and restore, and no `set -o pipefail`: without it a failed dump would still report success. MySQL adds `--set-gtid-purged=OFF` only outside MariaDB, always dumps routines/triggers/events, and grants `MYSQL_USER` on the copy.
 - Markers: `wt.project`, `wt.slug`, `wt.complete` in the Postgres comment or the `__wt_meta` table. `Missing` creates, `Reuse` reuses, `Recreate` drops and copies, `Foreign` is refused (and `down --force` may drop it).
-- `up` plans and validates every target before `state.save` and before the checkout exists. `ls` precedence: `orphan`, then `unknown` (Docker unreachable, or a source stopped, with copies), then container status, then `shared`/`partial`/`no-db`, then the old `ready`/`no-db`.
+- `up` plans and validates every source and target before `state.save` and before the checkout exists. `ls` precedence: `orphan`; `unknown` when Docker is unreachable and copies exist; container status; then the database verdict (`unknown` when a source is stopped or gone, else `shared`/`partial`/`no-db`); then the old `ready`/`no-db`.
 
 ## Adding a container adapter
 

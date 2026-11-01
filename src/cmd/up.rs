@@ -104,8 +104,9 @@ pub fn run(branch: &str, base: Option<&str>) -> Result<()> {
                     database::prepare(svc, src, &env, copies)?;
                     let owned: Vec<DatabaseCopy> =
                         copies.iter().map(|(copy, _)| copy.clone()).collect();
-                    let primary =
-                        database::primary(&owned).expect("plan always has at least one database");
+                    let primary = database::primary(&owned).ok_or_else(|| {
+                        anyhow::anyhow!("no database planned for {}", svc.kind.name())
+                    })?;
                     database::verify(svc, src, &primary.target)?;
                 }
             }

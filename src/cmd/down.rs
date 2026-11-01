@@ -81,6 +81,24 @@ pub fn run(slug_arg: Option<&str>, opts: Options) -> Result<()> {
         None => false,
     };
 
+    // Drop the copies before the containers, so a refusal leaves everything
+    // intact instead of removing the clones first.
+    let mut protected = BTreeSet::new();
+    for svc in &cfg.services {
+        protected.extend(svc.databases.iter().cloned());
+        if let Some(database) = &svc.database {
+            protected.insert(database.clone());
+        }
+    }
+    // `dropped` is false when the copies could not be dropped (Docker down, or
+    // the source stopped or gone): the state file stays behind so a later run
+    // can finish the job.
+    let dropped = if state.databases.is_empty() || !docker_ok {
+        state.databases.is_empty()
+    } else {
+        database::drop_all(&state.databases, &env, opts.force, &protected)?
+    };
+
     for name in &target.containers {
         docker::remove_container(name)?;
         println!("Removed {name}");
@@ -89,15 +107,6 @@ pub fn run(slug_arg: Option<&str>, opts: Options) -> Result<()> {
         docker::remove_volume(name)?;
         println!("Removed {name}");
     }
-
-    // `dropped` is false when the copies could not be dropped (Docker down, or
-    // the source stopped under --force): the state file stays behind so a later
-    // run can finish the job.
-    let dropped = if state.databases.is_empty() || !docker_ok {
-        state.databases.is_empty()
-    } else {
-        database::drop_all(&state.databases, &env, opts.force)?
-    };
 
     let mut kept = state;
     if opts.keep_checkout {
