@@ -304,8 +304,8 @@ impl Drop for RestoreOnDrop {
 /// Whether a finished copy left its marker. An error means the check itself
 /// failed (daemon, image, no `sh`), which says nothing about the volume, so
 /// the caller must not treat it as a half-copy and discard the data.
-fn marker_present(image: &str, volume: &str) -> Result<bool> {
-    let out = docker::run_shell(image, &[format!("{volume}:/v")], &marker_script())
+fn marker_present(image: &str, volume: &str, labels: &[(&str, String)]) -> Result<bool> {
+    let out = docker::run_shell(image, &[format!("{volume}:/v")], labels, &marker_script())
         .with_context(|| format!("could not check whether {volume} is a finished copy"))?;
     parse_marker(&out)
 }
@@ -350,11 +350,13 @@ pub fn prepare_volume(svc: &Service, src: &Source, env: &Env) -> Result<()> {
     }
 
     if docker::volume(&volume).is_some() {
-        if marker_present(image, &volume)? {
+        if marker_present(image, &volume, &labels)? {
             println!("Reusing {volume}");
             return Ok(());
         }
         println!("Discarding half-copied {volume}");
+        // A Ctrl-C can leave the copy helper holding the volume for a moment.
+        docker::remove_containers_using_volume(&volume)?;
         docker::remove_volume(&volume)?;
     }
 
@@ -387,6 +389,7 @@ chown "$(stat -c '%u:%g' /from)" /to/{CLONE_MARKER}"#,
     let copied = docker::run_shell(
         image,
         &[format!("{}:/from:ro", src.volume), format!("{volume}:/to")],
+        &labels,
         &script,
     );
     restore_sources();

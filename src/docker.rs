@@ -340,7 +340,37 @@ pub fn create_volume(name: &str, labels: &[(&str, String)]) -> Result<()> {
 }
 
 pub fn remove_volume(name: &str) -> Result<()> {
-    sh::output(docker().args(["volume", "rm", "-f", name])).map(drop)
+    // A `docker run --rm` helper can outlive the Ctrl-C that killed its client
+    // and keep the volume busy for a moment; retry briefly instead of failing
+    // the whole `up` with an opaque "volume is in use".
+    let mut last = None;
+    for attempt in 0..3 {
+        match sh::output(docker().args(["volume", "rm", "-f", name])) {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                last = Some(error);
+                if attempt < 2 {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("could not remove volume {name}")))
+}
+
+/// Removes every container that mounts `volume`, so a half-copied volume can
+/// be discarded even while a helper is still going away.
+pub fn remove_containers_using_volume(volume: &str) -> Result<()> {
+    let ids = lines(&sh::output(docker().args([
+        "ps",
+        "-aq",
+        "--filter",
+        &format!("volume={volume}"),
+    ]))?);
+    for id in ids {
+        sh::output(docker().args(["rm", "-f", &id])).map(drop)?;
+    }
+    Ok(())
 }
 
 /// `docker run` with the given arguments; returns stdout.
@@ -349,8 +379,17 @@ pub fn run(args: &[String]) -> Result<String> {
 }
 
 /// A throwaway shell in `image` with volumes mounted, for copying or probing.
-pub fn run_shell(image: &str, mounts: &[String], script: &str) -> Result<String> {
+/// The labels let `down` see the helper if it ever outlives its client.
+pub fn run_shell(
+    image: &str,
+    mounts: &[String],
+    labels: &[(&str, String)],
+    script: &str,
+) -> Result<String> {
     let mut args = vec!["--rm".to_string(), "--user".into(), "0:0".into()];
+    for (key, value) in labels {
+        args.extend(["--label".into(), format!("{key}={value}")]);
+    }
     for m in mounts {
         args.push("-v".into());
         args.push(m.clone());
