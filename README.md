@@ -129,13 +129,13 @@ refresh = []                # like copy, but replaced whenever the main checkout
 [services.postgres]         # the same options apply to [services.mysql] and [services.redis]
 source = "<project>-postgres-1"   # the source container; defaults to the name compose gives it
 mode = "container"                # "database": copy logical databases inside the source instance
-databases = []                    # mode = "database": every source database to copy
+# databases = ["<source>"]        # mode = "database": every source database to copy; database is the one-item shorthand
 volume = "<detected>"             # the source's data volume (mode = "container" only)
 clone = true                      # false: empty volume, or empty databases in database mode
 port_range = [5433, 5499]         # mode = "container" only; database mode uses the source's port
 env = { DB_HOST = "127.0.0.1", DB_PORT = "{port}" }
 database = "postgres"             # postgres in container mode: the check target; in database mode, the one-item shorthand
-check_sql = "select 1"            # postgres only: the query that check runs; needs database (container) or databases (database mode)
+check_sql = "select 1"            # postgres only: the query that check runs; needs database in container mode, runs on the primary copy in database mode
 
 [services.sqlite]
 files = []                  # required: files relative to the repo root
@@ -177,7 +177,7 @@ env = {
 - Re-runs reuse a finished copy. A half-copied database (marker `complete=0`) is dropped and copied again, and only that one.
 - `down` drops every copy recorded in the state, including one whose database left `databases` (`up` warns and keeps it). `--keep-checkout` drops the copies and keeps the checkout.
 - Changing a worktree's mode is refused, not migrated: `up` stops with an error and points at `wt down <slug>` when a container or volume of ours (going to database mode) or a registered copy (going back to container mode) is in the way.
-- The source must publish its port: the worktree connects to it at `127.0.0.1:<published port>`. An ephemeral host port changes when the container is recreated, so publish a fixed one if long-lived worktrees rely on it.
+- The source must publish its port: the worktree connects to it at `127.0.0.1:<published port>`. An ephemeral host port changes when the container is recreated, so publish a fixed one if long-lived worktrees rely on it. A worktree keeps the port it recorded until the next `wt up`, which reads the new published port and rewrites the `.env`.
 
 Limitations: the copies are independent, so references between databases (a MySQL view naming another schema, Postgres FDW or dblink) still point at the source. Roles are global to the instance. There is no clonefile: a logical copy uses real disk. MyISAM tables are not transactional, and concurrent DDL can wait for the dump.
 
