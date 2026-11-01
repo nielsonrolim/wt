@@ -121,13 +121,13 @@ refresh = []                # como copy, mas substituídos sempre que o arquivo 
 [services.postgres]         # as mesmas opções valem para [services.mysql] e [services.redis]
 source = "<project>-postgres-1"   # o container de origem; o padrão é o nome que o compose dá
 mode = "container"                # "database": copia bancos lógicos dentro da instância de origem
-databases = []                    # mode = "database": todos os bancos de origem a copiar
+# databases = ["<origem>"]        # mode = "database": todos os bancos de origem a copiar; `database` é o atalho de um item
 volume = "<detectado>"            # o volume de dados do source (só em mode = "container")
 clone = true                      # false: volume vazio, ou bancos vazios no modo database
 port_range = [5433, 5499]         # só em mode = "container"; o modo database usa a porta da origem
 env = { DB_HOST = "127.0.0.1", DB_PORT = "{port}" }
 database = "postgres"             # postgres em container mode: o alvo da conferência; no modo database, o atalho de um item
-check_sql = "select 1"            # só postgres: a query dessa conferência; exige database (container) ou databases (modo database)
+check_sql = "select 1"            # só postgres: a query dessa conferência; exige database em container mode e roda no primário no modo database
 
 [services.sqlite]
 files = []                  # obrigatório: arquivos relativos à raiz do repo
@@ -169,7 +169,7 @@ env = {
 - Re-runs reaproveitam uma cópia pronta. Um banco copiado pela metade (marcador `complete=0`) é dropado e copiado de novo, e só ele.
 - O `down` dropa todas as cópias registradas no estado, incluindo a de um banco que saiu de `databases` (o `up` avisa e mantém). `--keep-checkout` dropa as cópias e mantém o checkout.
 - Trocar o modo de uma worktree é recusado, não migrado: o `up` para com erro e aponta `wt down <slug>` quando um container ou volume nosso (indo para o modo database) ou uma cópia registrada (voltando para container) está no caminho.
-- A origem precisa publicar a porta: a worktree conecta em `127.0.0.1:<porta publicada>`. Uma porta de host efêmera muda quando o container é recriado; publique uma fixa se worktrees duradouras dependerem dela.
+- A origem precisa publicar a porta: a worktree conecta em `127.0.0.1:<porta publicada>`. Uma porta de host efêmera muda quando o container é recriado; publique uma fixa se worktrees duradouras dependerem dela. Uma worktree mantém a porta registrada até o próximo `wt up`, que lê a nova porta publicada e reescreve o `.env`.
 
 Limitações: as cópias são independentes, então referências entre bancos (uma view MySQL citando outro schema, FDW ou dblink no Postgres) continuam apontando para a origem. Roles são globais na instância. Não há clonefile: uma cópia lógica ocupa disco de verdade. Tabelas MyISAM não são transacionais, e DDL concorrente pode esperar o dump.
 

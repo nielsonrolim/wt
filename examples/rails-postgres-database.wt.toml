@@ -1,8 +1,8 @@
 # A Rails app whose worktrees share the compose Postgres instance.
 # No container and no volume per worktree: each one gets its own logical
 # databases (`wt_<project>_<slug>__<source>`) inside the running instance.
-# Every `env` value must point the app at a copy, or the worktree would write
-# into the source database.
+# At least one `env` value must point the app at a copy, or the worktree would
+# write into the source database.
 
 [app]
 copy = ["storage"]   # Active Storage blobs the copied databases point at
