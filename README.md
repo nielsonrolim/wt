@@ -2,11 +2,11 @@
 
 English · [Português (Brasil)](README.pt-BR.md)
 
-Gives any app's git worktrees their own databases and web port. `wt up feat/x` creates the worktree and clones the main checkout's development databases into it (Postgres, MySQL/MariaDB, Redis/Valkey, SQLite). It starts each clone on a free port and writes the worktree's `.env` to point at them. `wt down` tears it all down, asking about the branch and keeping it by default.
+Gives any app's git worktrees their own databases and web port. `wt up feat/x` creates the worktree and clones the main checkout's development databases into it (Postgres, MySQL/MariaDB, Redis/Valkey, SQLite). Each clone gets its own container by default; with `mode = "database"` the worktree instead gets its own logical databases inside the main instance, with no container at all. `wt` starts each clone on a free port and writes the worktree's `.env` to point at them. `wt down` tears it all down, asking about the branch and keeping it by default.
 
 ## Why this exists
 
-Two branches sharing one database step on each other. One branch's migration breaks the other, their seeds get mixed, and one parallel test suite knocks over the other. A worktree isolates the code but not the database. `wt` gives each worktree its own byte-for-byte copy of the development database in seconds. On APFS, clonefile means the copy costs no disk space until something writes to it.
+Two branches sharing one database step on each other. One branch's migration breaks the other, their seeds get mixed, and one parallel test suite knocks over the other. A worktree isolates the code but not the database. `wt` gives each worktree its own byte-for-byte copy of the development database in seconds. On APFS, clonefile means the copy costs no disk space until something writes to it. Where a container is overkill, `mode = "database"` copies the databases inside the instance that is already running.
 
 Whatever differs between apps lives in a `.wt.toml`. Everything `wt` can find out on its own (image, command, credentials, volume) is read from the source container.
 
@@ -18,7 +18,7 @@ Prebuilt binaries for Linux x86_64 and macOS (Intel and Apple Silicon):
 curl -fsSL https://raw.githubusercontent.com/nielsonrolim/wt/main/install.sh | sh
 ```
 
-The script downloads the latest release, checks its SHA-256 and installs `~/.local/bin/wt`. `WT_VERSION=v0.2.0` pins a release and `WT_INSTALL_DIR` changes where the binary goes.
+The script downloads the latest release, checks its SHA-256 and installs `~/.local/bin/wt`. `WT_VERSION=v0.3.0` pins a release and `WT_INSTALL_DIR` changes where the binary goes.
 
 With Rust:
 
@@ -51,26 +51,28 @@ Run it from the main checkout. If the branch exists, `wt` checks it out; otherwi
 Steps, in order:
 
 1. Creates the worktree at `<root>/<slug>`, through Herdr if it is available and with `git worktree add` otherwise. The slug is the branch name lowercased, with every other character turned into `-`, up to 40 characters: `feat/ENG-12_x` → `feat-eng-12-x`. A branch whose slug is already taken by another branch's worktree (`feat/x` and `feat-x`) is refused.
-2. Picks the ports: the web port and one per service, each from its own range. It skips ports published by any container (stopped ones included), ports already given to another worktree of any project, and ports something is listening on.
+2. Picks the ports: the web port and one per service, each from its own range. It skips ports published by any container (stopped ones included), ports already given to another worktree of any project, and ports something is listening on. A service in `mode = "database"` has no port of its own: it uses the source's published port.
 3. Writes the worktree's `.env`, copied from the main checkout the first time, and `.envrc`.
 4. Copies the SQLite files and the `app.copy` paths, and refreshes the `app.refresh` paths.
 5. Runs `hooks.setup`.
-6. For each service, clones the volume and starts the container. It then waits until the service is ready and checks that the data came across.
+6. For each service, clones the volume and starts the container, or, with `mode = "database"`, copies the logical databases inside the source instance. It then waits until the service is ready and checks that the data came across.
 7. Runs `hooks.after_services`.
 
 ### `wt down [slug] [--keep-checkout] [--delete-branch] [--yes] [--force]`
 
-Removes the worktree's containers and volumes, its checkout and its port record. Once the checkout is on its way out, it asks whether to delete the branch too, and keeps it by default. Without a slug, it uses the worktree you are in (and asks you to step out of it), or shows a list to pick from.
+Removes the worktree's containers and volumes, the databases it copied inside the source instance, its checkout and its port record. Once the checkout is on its way out, it asks whether to delete the branch too, and keeps it by default. Without a slug, it uses the worktree you are in (and asks you to step out of it), or shows a list to pick from.
 
 Safeguards:
 
-- It removes only resources carrying this worktree's `wt.project` and `wt.slug` labels (or the `docker.slug_label` one, if configured). It refuses a container or volume that merely has the expected name, unless you pass `--force`.
+- It removes only resources carrying this worktree's `wt.project` and `wt.slug` labels (or the `docker.slug_label` one, if configured). A container or volume that merely has the expected name is refused, unless you pass `--force`.
+- It removes a copied database only when its marker names this project and slug; a database that merely has the expected name is refused without `--force`. It never drops the source database.
 - It never removes a source container or a volume mounted in one.
 - It refuses a checkout with uncommitted changes; `--force` overrides this.
 - It asks for confirmation, then about the branch. Without a terminal, it requires `--yes` (or `WT_YES=1`). Both answer with the default: keep the branch.
 - It offers the branch only when this worktree's own checkout is going away, and deletes it after the checkout is gone. A branch still checked out somewhere else — the main checkout included — is never touched.
+- If Docker is unreachable, or the source is stopped and you pass `--force`, the copied databases cannot be dropped: `down` removes the checkout but keeps the state file, so a later run can finish the job. A stopped source without `--force` stops `down` with an error. The source is never started for you.
 
-`--keep-checkout` removes only the containers and volumes; the worktree and its web port stay, so there is no branch to ask about.
+`--keep-checkout` removes the containers, volumes and copied databases; the worktree and its web port stay, so there is no branch to ask about.
 
 `--delete-branch` skips the prompt and deletes the branch after the checkout is gone, losing commits it never merged anywhere. It cannot be combined with `--keep-checkout`.
 
@@ -84,11 +86,15 @@ feat-x  feat/x  3001  5433      6380   running  47.69MB+109B
 | STATUS | Meaning |
 |---|---|
 | `running` | every container is up |
-| `partial` | some containers are up |
+| `partial` | some containers are up, or some registered database copies are missing |
 | `stopped` | containers created, none running |
-| `no-db` | checkout without containers (`wt up <branch>` creates them) |
+| `shared` | no container; every database copy registered in the state exists |
+| `no-db` | checkout without containers or database copies (`wt up <branch>` creates them) |
 | `ready` | project without services, checkout present |
+| `unknown` | Docker is unreachable and the worktree has database copies, so `ls` cannot tell |
 | `orphan` | resources left behind, checkout gone (`wt down <slug>`) |
+
+`orphan` is decided from the filesystem and wins over `unknown`; a container of the worktree wins over the database verdict. `wt ls` never changes anything.
 
 ### `wt init [--force]`
 
@@ -122,12 +128,14 @@ refresh = []                # like copy, but replaced whenever the main checkout
 
 [services.postgres]         # the same options apply to [services.mysql] and [services.redis]
 source = "<project>-postgres-1"   # the source container; defaults to the name compose gives it
-volume = "<detected>"             # the source's data volume
-clone = true                      # false: empty volume, same image/command/env
-port_range = [5433, 5499]
+mode = "container"                # "database": copy logical databases inside the source instance
+databases = []                    # mode = "database": every source database to copy
+volume = "<detected>"             # the source's data volume (mode = "container" only)
+clone = true                      # false: empty volume, or empty databases in database mode
+port_range = [5433, 5499]         # mode = "container" only; database mode uses the source's port
 env = { DB_HOST = "127.0.0.1", DB_PORT = "{port}" }
-database = "postgres"             # postgres only: the database used to check the clone
-check_sql = "select 1"            # postgres only: the query that check runs; needs database
+database = "postgres"             # postgres in container mode: the check target; in database mode, the one-item shorthand
+check_sql = "select 1"            # postgres only: the query that check runs; needs database (container) or databases (database mode)
 
 [services.sqlite]
 files = []                  # required: files relative to the repo root
@@ -147,6 +155,32 @@ The key of `[services.<type>]` is the type itself: `postgres`, `mysql`, `redis` 
 
 The config repeats nothing from compose. `wt` reads the image, entrypoint, command, environment variables, user, working directory, container port, data directory, shared-memory size and ulimits from the source container with `docker inspect`, so the clone always boots exactly like the source. The clone also gets the source's bind mounts (config files, init scripts), always read-only, and its tmpfs mounts. Its other named volumes and anything mounted inside the data directory are left out, so the clone never writes into state the source owns. The data volume is the one mounted at the type's default data directory. Failing that, it is the container's only volume. If there are several and none sits in the default place, set `volume`. Data in a bind mount is not supported. Neither is data split across mounts: `wt up` refuses a source with anything mounted inside its data directory (a `pg_wal` bind, say) or a Postgres with `POSTGRES_INITDB_WALDIR`, because only the data volume is copied and the clone would boot without the rest. Set `clone = false` to give such a service an empty database instead. When the source publishes several ports (MySQL's 3306 and 33060), the clone uses the type's standard port if it is among them, and the lowest TCP port otherwise.
 
+### Database mode
+
+`mode = "database"` gives the worktree its own logical databases inside the source instance instead of a container. No image is booted, no volume is copied, and the source is never stopped. It works for Postgres and MySQL/MariaDB. Redis has no separate databases to copy, and SQLite already is one file: its copy is the whole database.
+
+```toml
+[services.postgres]
+mode = "database"
+databases = ["myapp_development", "myapp_cache"]
+env = {
+  DATABASE_URL = "postgres://app:app@127.0.0.1:{port}/{database}",
+  CACHE_URL    = "postgres://app:app@127.0.0.1:{port}/{database:myapp_cache}",
+}
+```
+
+- `databases` lists every source database to copy. `database = "x"` is the one-item shorthand; setting both is an error. With neither, `wt` copies the one database the image's own env names (`POSTGRES_DB`/`POSTGRES_USER`, `MYSQL_DATABASE`/`MARIADB_DATABASE`). All of them are copied, so an app with several logical databases needs no extra service.
+- The first entry is the primary: `{database}` is its copy, and `check_sql` runs on it. `{database:<source>}` is the copy of another entry. At least one `env` value in this mode must use `{database}` or `{database:<source>}`, or the worktree would write into the source; `wt` refuses the config otherwise.
+- Each source database becomes `wt_<project>_<slug>__<source>`, sanitized to `[a-z0-9_]` and at most 63 bytes, with a deterministic hash when it would be longer. The name does not depend on the list order, and two names that map to the same target are refused.
+- Ownership is the database itself: a Postgres copy carries `wt.project`, `wt.slug` and `wt.complete` in its database comment; a MySQL copy carries them in a `__wt_meta` table. A database without that marker is refused by `up` and by `down` (unless `--force`), and the source database is never dropped.
+- The copy is a dump written to a file inside the container and restored from it, so a failed dump cannot be mistaken for a finished copy. Postgres uses `pg_dump`/`psql`; MySQL uses `mysqldump`/`mysql` with `--single-transaction --routines --triggers --events` (`--set-gtid-purged=OFF` only on MySQL, not MariaDB), then grants the app user on the new database.
+- Re-runs reuse a finished copy. A half-copied database (marker `complete=0`) is dropped and copied again, and only that one.
+- `down` drops every copy recorded in the state, including one whose database left `databases` (`up` warns and keeps it). `--keep-checkout` drops the copies and keeps the checkout.
+- Changing a worktree's mode is refused, not migrated: `up` stops with an error and points at `wt down <slug>` when a container or volume of ours (going to database mode) or a registered copy (going back to container mode) is in the way.
+- The source must publish its port: the worktree connects to it at `127.0.0.1:<published port>`. An ephemeral host port changes when the container is recreated, so publish a fixed one if long-lived worktrees rely on it.
+
+Limitations: the copies are independent, so references between databases (a MySQL view naming another schema, Postgres FDW or dblink) still point at the source. Roles are global to the instance. There is no clonefile: a logical copy uses real disk. MyISAM tables are not transactional, and concurrent DDL can wait for the dump.
+
 | | Postgres | MySQL/MariaDB | Redis/Valkey | SQLite |
 |---|---|---|---|---|
 | Images (`wt init`) | `postgres`, `postgis`, `pgvector`, `timescaledb` | `mysql`, `mariadb`, `percona` | `redis`, `valkey`, `keydb`, `redis-stack`, `redis-stack-server` | `*.sqlite3` files |
@@ -155,6 +189,7 @@ The config repeats nothing from compose. `wt` reads the image, entrypoint, comma
 | Default `env` | `DB_HOST`, `DB_PORT` | `DB_HOST`, `DB_PORT` | `REDIS_URL=redis://127.0.0.1:{port}/0` | — |
 | Ready when | `pg_isready` over TCP | `mysqladmin ping` | `redis-cli ping` | — |
 | Check | `select 1` on `database`, or `check_sql` | ping | ping | — |
+| Database mode | yes | yes | no (no separate databases) | n/a (the file copy is the database) |
 
 In `env`, `{port}` becomes the clone's host port. The values use `127.0.0.1`, not `localhost`, because the clone publishes on IPv4 only and macOS resolves `localhost` to `::1` first.
 
@@ -162,7 +197,7 @@ The ranges don't overlap each other or the web port. Each sits above its databas
 
 ### The main database during the clone
 
-A byte-for-byte copy needs the database at rest, because a live data directory holds half-written pages. So `wt up` stops the source container (`docker stop`), copies the volume and starts it again. The source is down only for the seconds the copy takes, and comes back even if the copy fails or you press Ctrl-C. This happens only the first time, since re-runs reuse a cloned volume. A half-copied volume (one with neither the `.wt-clone-complete` marker nor the `.worktree-clone-complete` one that `bin/worktree`-style scripts write) is discarded and copied again. If the marker check itself cannot run, `wt up` stops with an error and leaves the volume alone.
+A byte-for-byte copy needs the database at rest, because a live data directory holds half-written pages. So `wt up` stops the source container (`docker stop`), copies the volume and starts it again. The source is down only for the seconds the copy takes, and comes back even if the copy fails or you press Ctrl-C. This happens only the first time, since re-runs reuse a cloned volume. A half-copied volume (one with neither the `.wt-clone-complete` marker nor the `.worktree-clone-complete` one that `bin/worktree`-style scripts write) is discarded and copied again. If the marker check itself cannot run, `wt up` stops with an error and leaves the volume alone. A service in `mode = "database"` never stops the source: it takes a consistent dump of each database while the stack keeps running.
 
 SQLite stops nothing: `sqlite3 .backup` takes a consistent copy even while the app has the file open. Without the `sqlite3` CLI, `wt` copies the file along with its `-wal`/`-shm` files. Each file is copied only once; delete the worktree's copy to copy it again.
 
@@ -195,7 +230,7 @@ after_services = [["bin/rails", "db:prepare"]]
 
 Without a shell there are no pipes, `||`, globs or `$VAR`. For those, point at a script in the repo (`["bin/setup"]`) or call the shell explicitly (`["sh", "-c", "…"]`).
 
-Hooks get these variables in their environment: `WT_SLUG`, `WT_BRANCH`, `WT_PATH`, `WT_MAIN_ROOT`, `WT_APP_PORT`, and `WT_POSTGRES_PORT`/`WT_MYSQL_PORT`/`WT_REDIS_PORT` for the configured services only.
+Hooks get these variables in their environment: `WT_SLUG`, `WT_BRANCH`, `WT_PATH`, `WT_MAIN_ROOT`, `WT_APP_PORT`, and `WT_POSTGRES_PORT`/`WT_MYSQL_PORT`/`WT_REDIS_PORT` for the configured services only. In `mode = "database"`, they also get `WT_POSTGRES_DATABASE`/`WT_MYSQL_DATABASE` (the primary copy's name) and `WT_POSTGRES_DATABASES`/`WT_MYSQL_DATABASES` (`source=target,source=target`).
 
 ## Examples
 
@@ -206,6 +241,25 @@ Hooks get these variables in their environment: `WT_SLUG`, `WT_BRANCH`, `WT_PATH
 copy = ["storage"]
 
 [services.postgres]
+
+[hooks]
+setup = [["bundle", "install"], ["bun", "install"]]
+after_services = [["bin/rails", "db:prepare"]]
+```
+
+**Rails with Postgres, sharing the main instance** ([`examples/rails-postgres-database.wt.toml`](examples/rails-postgres-database.wt.toml)): no container per worktree; each worktree gets its own logical databases inside the compose Postgres.
+
+```toml
+[app]
+copy = ["storage"]
+
+[services.postgres]
+mode = "database"
+databases = ["myapp_development", "myapp_cache"]
+env = {
+  DATABASE_URL = "postgres://app:app@127.0.0.1:{port}/{database}",
+  CACHE_DATABASE_URL = "postgres://app:app@127.0.0.1:{port}/{database:myapp_cache}",
+}
 
 [hooks]
 setup = [["bundle", "install"], ["bun", "install"]]
@@ -247,6 +301,7 @@ after_services = [["pnpm", "prisma", "migrate", "deploy"]]
 | Worktree | `<root>/<slug>` (default `~/.herdr/worktrees/<project>/<slug>`) |
 | Containers | `<project>-wt-<slug>-<type>`, labelled `wt.project`, `wt.slug`, `wt.service` (and `slug_label`, if set) |
 | Volumes | `<project>-wt-<slug>-<type>-data`, with the same labels |
+| Copied databases (`mode = "database"`) | `wt_<project>_<slug>__<source>`, inside the source instance, proven by the database comment / `__wt_meta` and recorded in the state |
 | Ports | `~/.local/state/wt/<project>/<slug>.toml` (honours `XDG_STATE_HOME`) |
 
 With `docker.legacy_names`, Postgres is `<project>-wt-<slug>` and its volume `<project>-wt-<slug>-db`.
@@ -276,7 +331,7 @@ Ports live outside the checkout so they never show up in `git status`. A re-run 
 ```bash
 cargo test                          # unit tests
 cargo clippy --all-targets -- -D warnings
-tests/e2e.sh                        # full cycle against a throwaway compose stack (Postgres + MySQL + Redis + SQLite)
+tests/e2e.sh                        # full cycle against a throwaway compose stack (Postgres + MySQL + Redis + SQLite), in both modes
 ```
 
 ## License
