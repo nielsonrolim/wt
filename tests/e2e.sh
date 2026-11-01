@@ -950,10 +950,15 @@ EOF
 "$WT" up db/gone >/dev/null
 # Remove the container but keep its volume: the copies come back with it.
 docker compose rm -sf postgres >/dev/null
+"$WT" ls >"$WORK/ls-gone.log"
+awk -v s=db-gone '$1==s {for(i=1;i<=NF;i++) if($i=="unknown") ok=1} END{exit !ok}' "$WORK/ls-gone.log" || fail "ls must be unknown with the source gone"
 "$WT" down db/gone --yes >"$WORK/gone.log" 2>&1 || fail "down failed with a gone source"
 grep -q 'is gone' "$WORK/gone.log" || fail "down did not say the source is gone"
 [ "$(grep -c '^\[\[databases\]\]' "$STATE_DIR/db-gone.toml")" = 2 ] || fail "state dropped with a gone source"
 [ ! -e "$WORK/root/db-gone" ] || fail "checkout kept with a gone source"
 docker compose up -d --wait postgres >/dev/null 2>&1
+"$WT" up db/gone >/dev/null
+"$WT" ls >"$WORK/ls-back.log"
+awk -v s=db-gone '$1==s {for(i=1;i<=NF;i++) if($i=="shared") ok=1} END{exit !ok}' "$WORK/ls-back.log" || fail "ls must be shared after the source returns"
 "$WT" down db/gone --yes >/dev/null
 [ "$(pg "select count(*) from pg_database where datname like 'wt_wte2e_db_gone__%'")" = 0 ] || fail "copies left after the source returned"

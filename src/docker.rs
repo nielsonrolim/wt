@@ -369,20 +369,28 @@ pub fn exec(container: &str, argv: &[&str]) -> Result<String> {
     sh::output(docker().args(["exec", container]).args(argv))
 }
 
+fn exec_env_args(container: &str, env: &[(&str, &str)], argv: &[&str]) -> Vec<String> {
+    let mut args = vec!["exec".to_string()];
+    for (key, _) in env {
+        args.push("-e".into());
+        args.push((*key).to_string());
+    }
+    args.push(container.to_string());
+    args.extend(argv.iter().map(|a| (*a).to_string()));
+    args
+}
+
 /// `docker exec` with environment variables. The value is set on the Docker
 /// client and passed as a bare `-e NAME`, so it does not appear in the argv
 /// (and therefore not in `ps` or an error message): the daemon copies it from
 /// the client's environment.
 pub fn exec_env(container: &str, env: &[(&str, &str)], argv: &[&str]) -> Result<String> {
     let mut cmd = docker();
-    cmd.arg("exec");
-    for (key, _) in env {
-        cmd.arg("-e").arg(key);
-    }
+    cmd.args(exec_env_args(container, env, argv));
     for (key, value) in env {
         cmd.env(key, value);
     }
-    sh::output(cmd.arg(container).args(argv))
+    sh::output(&mut cmd)
 }
 
 pub fn logs_tail(container: &str) -> String {
@@ -468,6 +476,18 @@ mod tests {
         let c = with_bindings(r#"{"3306/tcp": [{"HostPort": "3306"}]}"#);
         assert_eq!(c.shm_size(), 0);
         assert!(c.ulimits().is_empty());
+    }
+
+    #[test]
+    fn env_values_stay_out_of_the_argv() {
+        let args = exec_env_args("db", &[("MYSQL_PWD", "s3cret")], &["mysql"]);
+        assert!(args.contains(&"-e".to_string()));
+        assert!(args.contains(&"MYSQL_PWD".to_string()));
+        assert!(!args.iter().any(|arg| arg.contains("s3cret")), "{args:?}");
+        assert!(
+            !args.iter().any(|arg| arg.contains("MYSQL_PWD=")),
+            "{args:?}"
+        );
     }
 
     #[test]

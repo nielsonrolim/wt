@@ -1252,6 +1252,28 @@ mod tests {
         assert!(script.matches(DUMP_FILE).count() >= 2, "{script}");
         assert!(script.contains("trap"), "{script}");
         assert!(script.contains("&&"), "{script}");
+
+        // One dump file per target: two worktrees cannot share a temporary.
+        let a_file = dump_file("wt_p_s__a");
+        let b_file = dump_file("wt_p_s__b");
+        assert_ne!(a_file, b_file);
+        for script in [
+            pg_copy_script("app", "wt_p_s__a", "app"),
+            md_script("wt_p_s__a"),
+        ] {
+            assert!(script.contains(&a_file), "{script}");
+            assert!(!script.contains(&b_file), "{script}");
+        }
+        for script in [
+            pg_copy_script("app", "wt_p_s__b", "app"),
+            md_script("wt_p_s__b"),
+        ] {
+            assert!(script.contains(&b_file), "{script}");
+        }
+    }
+
+    fn md_script(target: &str) -> String {
+        mysql_copy_script("app", target, "mysql  Ver 8.0.36")
     }
 
     #[test]
