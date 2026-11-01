@@ -2,6 +2,7 @@ use anyhow::Result;
 
 use crate::cmd::known_slugs;
 use crate::config::Config;
+use crate::database;
 use crate::docker::{self, Container, Volume};
 use crate::project::{self, Env, LABEL_PROJECT};
 use crate::state::State;
@@ -63,6 +64,13 @@ pub fn run() -> Result<()> {
 
     for (env, containers, volumes) in &rows {
         let state = State::load(&env.project, &env.slug);
+        for copy in &state.databases {
+            if let Some(kind) = Kind::from_name(&copy.service)
+                && !kinds.contains(&kind)
+            {
+                kinds.push(kind);
+            }
+        }
         let mut row = vec![
             env.slug.clone(),
             git::current_branch(&env.path).unwrap_or_else(|| "-".into()),
@@ -77,7 +85,17 @@ pub fn run() -> Result<()> {
                 published.or(state.ports.get(kind.name()).copied()),
             ));
         }
-        row.push(status(&cfg, env, containers, !volumes.is_empty()).into());
+        row.push(
+            status(
+                &cfg,
+                env,
+                containers,
+                !volumes.is_empty(),
+                &state,
+                docker_ok,
+            )
+            .into(),
+        );
         let disk: Vec<&str> = volumes
             .iter()
             .filter_map(|v| sizes.get(&v.name).map(String::as_str))
@@ -122,18 +140,61 @@ fn port_cell(port: Option<u16>) -> String {
     port.map_or_else(|| "-".into(), |p| p.to_string())
 }
 
-fn status(cfg: &Config, env: &Env, containers: &[Container], has_volumes: bool) -> &'static str {
+fn status(
+    cfg: &Config,
+    env: &Env,
+    containers: &[Container],
+    has_volumes: bool,
+    state: &State,
+    docker_ok: bool,
+) -> &'static str {
+    // A missing checkout is a filesystem fact and needs no daemon.
     if !env.path.is_dir() {
         return "orphan";
     }
-    let running = containers.iter().filter(|c| c.state.running).count();
-    match (containers.len(), running) {
-        (0, _) if cfg.services.is_empty() && !has_volumes => "ready",
-        (0, _) => "no-db",
-        (n, r) if n == r => "running",
-        (_, 0) => "stopped",
-        _ => "partial",
+    if !docker_ok && !state.databases.is_empty() {
+        return "unknown";
     }
+    if !containers.is_empty() {
+        let running = containers.iter().filter(|c| c.state.running).count();
+        return match (containers.len(), running) {
+            (n, r) if n == r => "running",
+            (_, 0) => "stopped",
+            _ => "partial",
+        };
+    }
+    if docker_ok
+        && !state.databases.is_empty()
+        && let Some(verdict) = database_status(state)
+    {
+        return verdict;
+    }
+    if cfg.services.is_empty() && !has_volumes {
+        "ready"
+    } else {
+        "no-db"
+    }
+}
+
+/// Whether the registered copies still exist. One query per copy, and only
+/// when the worktree has no container of its own.
+fn database_status(state: &State) -> Option<&'static str> {
+    if state.databases.is_empty() {
+        return None;
+    }
+    let existing = state
+        .databases
+        .iter()
+        .filter(|copy| {
+            docker::container(&copy.source)
+                .is_some_and(|container| database::exists(copy, &container).unwrap_or(false))
+        })
+        .count();
+    Some(match existing {
+        n if n == state.databases.len() => "shared",
+        0 => "no-db",
+        _ => "partial",
+    })
 }
 
 fn print_table(rows: &[Vec<String>]) {

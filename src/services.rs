@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
-use crate::config::Service;
+use crate::config::{Mode, Service};
 use crate::docker::{self, Container};
 use crate::project::Env;
 
@@ -128,7 +128,20 @@ done"#
     }
 }
 
-/// What the clone copies from: the source container and its data volume.
+/// What the clone boots from: the source container and the port inside it.
+pub struct ContainerSource {
+    pub container: Container,
+    pub container_port: u16,
+}
+
+/// What a byte copy needs: the source volume and where it is mounted.
+#[derive(Debug)]
+pub struct VolumeSource {
+    pub volume: String,
+    pub data_dir: String,
+}
+
+/// Everything the container clone needs: the source container and its volume.
 pub struct Source {
     pub container: Container,
     pub volume: String,
@@ -136,7 +149,10 @@ pub struct Source {
     pub container_port: u16,
 }
 
-pub fn resolve_source(svc: &Service) -> Result<Source> {
+/// Resolves only the container. `mode = "database"` never copies a volume, so
+/// it must not require one (a source with all its data in a bind mount is a
+/// valid source for a logical copy).
+pub fn resolve_container(svc: &Service) -> Result<ContainerSource> {
     let kind = svc.kind.name();
     let Some(container) = docker::container(&svc.source) else {
         bail!(
@@ -144,7 +160,24 @@ pub fn resolve_source(svc: &Service) -> Result<Source> {
             svc.source
         );
     };
+    Ok(ContainerSource {
+        container_port: container
+            .container_port(svc.kind.default_container_port())
+            .unwrap_or(svc.kind.default_container_port()),
+        container,
+    })
+}
 
+/// Whether this service needs the source's data volume. `mode = "database"`
+/// only copies logical databases, so a source whose data sits in a bind mount
+/// (or in several mounts) is fine there.
+pub fn copies_volume(svc: &Service) -> bool {
+    svc.mode == Mode::Container
+}
+
+/// The volume a byte copy copies, and where the image mounts it.
+pub fn resolve_volume(svc: &Service, container: &Container) -> Result<VolumeSource> {
+    let kind = svc.kind.name();
     let mount = match &svc.volume {
         Some(volume) => container
             .volume_mounts()
@@ -169,17 +202,39 @@ pub fn resolve_source(svc: &Service) -> Result<Source> {
     };
 
     if svc.clone {
-        check_self_contained(svc.kind, &container, &mount.destination)?;
+        check_self_contained(svc.kind, container, &mount.destination)?;
     }
 
-    Ok(Source {
+    Ok(VolumeSource {
         volume: mount.name.clone().unwrap_or_default(),
         data_dir: mount.destination.clone(),
-        container_port: container
-            .container_port(svc.kind.default_container_port())
-            .unwrap_or(svc.kind.default_container_port()),
-        container,
     })
+}
+
+pub fn resolve_source(svc: &Service) -> Result<Source> {
+    let container = resolve_container(svc)?;
+    let volume = resolve_volume(svc, &container.container)?;
+    Ok(Source {
+        container: container.container,
+        volume: volume.volume,
+        data_dir: volume.data_dir,
+        container_port: container.container_port,
+    })
+}
+
+/// The host port the source publishes for its database port. `mode = "database"`
+/// points the worktree at the main instance, so the source must be reachable
+/// from the host.
+pub fn host_port_for(src: &ContainerSource) -> Result<u16> {
+    src.container
+        .host_port(src.container_port)
+        .with_context(|| {
+            format!(
+                "{} publishes no host port for {}/tcp (publish it, or use mode = \"container\")",
+                src.container.name(),
+                src.container_port
+            )
+        })
 }
 
 /// Refuses a source whose data does not all live in the data volume. Only
@@ -195,7 +250,7 @@ fn check_self_contained(kind: Kind, container: &Container, data_dir: &str) -> Re
         .find(|m| m.destination.starts_with(&inside))
     {
         bail!(
-            "{source} mounts {} inside its data dir {data_dir}; wt copies only the data volume, so the clone would miss it (set clone = false to start empty)",
+            "{source} mounts {} inside its data dir {data_dir}; wt copies only the data volume, so the clone would miss it (set clone = false to start empty, or mode = \"database\" to copy the databases inside the source instance)",
             m.destination
         );
     }
@@ -208,7 +263,7 @@ fn check_self_contained(kind: Kind, container: &Container, data_dir: &str) -> Re
         && !Path::new(dir).starts_with(data_dir)
     {
         bail!(
-            "{source} keeps its WAL in {dir}, outside the data volume; wt copies only the data volume, so the clone would boot without it (set clone = false to start empty)"
+            "{source} keeps its WAL in {dir}, outside the data volume; wt copies only the data volume, so the clone would boot without it (set clone = false to start empty, or mode = \"database\" to copy the databases inside the source instance)"
         );
     }
     Ok(())
@@ -689,5 +744,48 @@ mod tests {
         assert!(check_self_contained(Kind::Postgres, &inside, dir).is_ok());
         // The variable means nothing to other images.
         assert!(check_self_contained(Kind::Mysql, &waldir, dir).is_ok());
+    }
+
+    #[test]
+    fn database_mode_needs_no_volume() {
+        assert!(copies_volume(&service(Kind::Postgres, Mode::Container)));
+        assert!(!copies_volume(&service(Kind::Postgres, Mode::Database)));
+
+        // A source whose data is split across mounts is still refused for a
+        // byte copy; database mode never asks for the volume at all.
+        let dir = "/var/lib/postgresql/data";
+        let nested = container_with(
+            &format!(
+                r#"[{{"Type":"volume","Name":"db","Destination":"{dir}"}},
+                    {{"Type":"bind","Source":"/r/wal","Destination":"{dir}/pg_wal"}}]"#
+            ),
+            "[]",
+        );
+        let svc = service(Kind::Postgres, Mode::Container);
+        let err = format!("{:#}", resolve_volume(&svc, &nested).unwrap_err());
+        assert!(err.contains("inside its data dir"), "{err}");
+
+        // A database-mode source may keep its data only in a bind mount.
+        let bind_only = container_with(
+            r#"[{"Type":"bind","Source":"/r/data","Destination":"/var/lib/postgresql/data"}]"#,
+            "[]",
+        );
+        assert!(bind_only.volume_mounts().next().is_none());
+        assert!(!copies_volume(&service(Kind::Postgres, Mode::Database)));
+    }
+
+    fn service(kind: Kind, mode: Mode) -> Service {
+        Service {
+            kind,
+            source: "db".into(),
+            volume: None,
+            clone: true,
+            port_range: kind.default_port_range(),
+            mode,
+            databases: Vec::new(),
+            env: kind.default_env(),
+            database: None,
+            check_sql: None,
+        }
     }
 }

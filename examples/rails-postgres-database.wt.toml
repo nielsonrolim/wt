@@ -1,0 +1,28 @@
+# A Rails app whose worktrees share the compose Postgres instance.
+# No container and no volume per worktree: each one gets its own logical
+# databases (`wt_<project>_<slug>__<source>`) inside the running instance.
+# Every `env` value must point the app at a copy, or the worktree would write
+# into the source database.
+
+[app]
+copy = ["storage"]   # Active Storage blobs the copied databases point at
+# Untracked files you edit in the main checkout and want every worktree to follow:
+# refresh = [".claude/agents"]
+
+[services.postgres]
+mode = "database"
+databases = ["myapp_development", "myapp_cache"]
+env = {
+  DATABASE_URL = "postgres://app:app@127.0.0.1:{port}/{database}",
+  CACHE_DATABASE_URL = "postgres://app:app@127.0.0.1:{port}/{database:myapp_cache}",
+}
+# check_sql = "select count(*) from schema_migrations"   # runs on the primary copy
+
+[hooks]
+setup = [
+  ["bundle", "install"],
+  ["bun", "install"],
+]
+after_services = [
+  ["bin/rails", "db:prepare"],
+]

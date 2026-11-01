@@ -1,5 +1,6 @@
 mod cmd;
 mod config;
+mod database;
 mod docker;
 mod envfile;
 mod files;
@@ -17,7 +18,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 /// A git worktree with its own databases and web port, cloned from the main
-/// checkout's development stack.
+/// checkout's development stack (or copied inside its instance).
 #[derive(Parser)]
 #[command(name = "wt", version)]
 struct Cli {
@@ -36,13 +37,13 @@ enum Command {
         #[arg(long, value_name = "REF")]
         base: Option<String>,
     },
-    /// Remove a worktree's containers, volumes and checkout
+    /// Remove a worktree's containers, volumes, copied databases and checkout
     ///
     /// The branch is kept unless you ask for it, and without a slug it uses the
     /// worktree you are standing in, or asks.
     Down {
         slug: Option<String>,
-        /// Remove only the containers and volumes
+        /// Remove only the containers, volumes and copied databases
         #[arg(long)]
         keep_checkout: bool,
         /// Also delete the branch, once the checkout is gone
@@ -51,15 +52,17 @@ enum Command {
         /// Skip the confirmation prompts
         #[arg(long)]
         yes: bool,
-        /// Also proceed on a dirty checkout or unlabelled resources
+        /// Also proceed on a dirty checkout or resources without a marker
         #[arg(long)]
         force: bool,
     },
     /// List every worktree environment of this project
     ///
-    /// STATUS: running (all containers up), partial, stopped, no-db (checkout
-    /// without containers), ready (project without services), orphan
-    /// (resources left behind, checkout gone: wt down <slug>).
+    /// STATUS: running (all containers up), partial, stopped, shared (no
+    /// container; every copied database exists), no-db (checkout without
+    /// containers or copies), ready (project without services), unknown
+    /// (Docker unreachable with copies), orphan (resources left behind,
+    /// checkout gone: wt down <slug>).
     #[command(visible_alias = "list")]
     Ls,
     /// Write a .wt.toml from the repo's compose containers and toolchain
