@@ -7,6 +7,7 @@ use anyhow::{Result, bail};
 
 use crate::cmd::known_slugs;
 use crate::config::Config;
+use crate::database;
 use crate::docker;
 use crate::project::{self, Env, LABEL_PROJECT, LABEL_SLUG};
 use crate::services::Kind;
@@ -33,6 +34,7 @@ pub fn run(slug_arg: Option<&str>, opts: Options) -> Result<()> {
     let docker_ok = docker::ensure_running().is_ok();
     let slug = resolve_slug(&main, &cfg, slug_arg)?;
     let env = Env::new(&cfg, &slug);
+    let state = State::load(&env.project, &env.slug);
 
     assert_safe_name(&env, &main)?;
     let target = if docker_ok {
@@ -47,12 +49,16 @@ pub fn run(slug_arg: Option<&str>, opts: Options) -> Result<()> {
     assert_not_inside(&env, &main)?;
 
     let has_checkout = env.path.is_dir();
-    if target.containers.is_empty() && target.volumes.is_empty() && !has_checkout {
+    if target.containers.is_empty()
+        && target.volumes.is_empty()
+        && state.databases.is_empty()
+        && !has_checkout
+    {
         State::remove(&env.project, &env.slug);
         bail!("nothing to remove for {slug}");
     }
 
-    describe(&env, &target);
+    describe(&env, &target, &state);
     if has_checkout && !opts.keep_checkout {
         check_dirty(&env, opts.force)?;
     }
@@ -84,13 +90,27 @@ pub fn run(slug_arg: Option<&str>, opts: Options) -> Result<()> {
         println!("Removed {name}");
     }
 
+    // `dropped` is false when the copies could not be dropped (Docker down, or
+    // the source stopped under --force): the state file stays behind so a later
+    // run can finish the job.
+    let dropped = if state.databases.is_empty() || !docker_ok {
+        state.databases.is_empty()
+    } else {
+        database::drop_all(&state.databases, &env, opts.force)?
+    };
+
+    let mut kept = state;
     if opts.keep_checkout {
-        let mut state = State::load(&env.project, &env.slug);
-        state.ports.clear();
-        state.save(&env.project, &env.slug)?;
+        if dropped {
+            kept.ports.clear();
+            kept.databases.clear();
+            kept.save(&env.project, &env.slug)?;
+        }
     } else {
         remove_checkout(&main, &env, opts.force)?;
-        State::remove(&env.project, &env.slug);
+        if dropped {
+            State::remove(&env.project, &env.slug);
+        }
     }
 
     if let Some(branch) = &branch {
@@ -256,7 +276,7 @@ fn assert_not_inside(env: &Env, main: &Path) -> Result<()> {
     Ok(())
 }
 
-fn describe(env: &Env, target: &Target) {
+fn describe(env: &Env, target: &Target, state: &State) {
     let sizes = if target.volumes.is_empty() {
         Default::default()
     } else {
@@ -269,6 +289,12 @@ fn describe(env: &Env, target: &Target) {
     for name in &target.volumes {
         let size = sizes.get(name).map(String::as_str).unwrap_or("?");
         println!("  volume    {name} ({size})");
+    }
+    for copy in &state.databases {
+        println!(
+            "  database {} (source {}, from {})",
+            copy.target, copy.source, copy.source_db
+        );
     }
     if env.path.is_dir() {
         let branch = git::current_branch(&env.path).unwrap_or_else(|| "?".into());

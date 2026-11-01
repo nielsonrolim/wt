@@ -225,6 +225,8 @@ mod tests {
         assert_eq!(cfg.app.copy, vec!["storage"]);
         assert_eq!(cfg.hooks.setup.len(), 2);
         assert_eq!(cfg.sqlite.unwrap().files.len(), 1);
+        // The generated file stays on the default (container) mode.
+        assert!(!text.contains("mode ="), "{text}");
     }
 
     #[test]

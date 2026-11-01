@@ -8,11 +8,33 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de};
 
 use crate::services::Kind;
 
 pub const FILE_NAME: &str = ".wt.toml";
+
+/// Where a worktree's data lives: its own container and copied volume, or a
+/// database copied inside the source instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    #[default]
+    Container,
+    Database,
+}
+
+impl<'de> Deserialize<'de> for Mode {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        match raw.as_str() {
+            "container" => Ok(Mode::Container),
+            "database" => Ok(Mode::Database),
+            _ => Err(de::Error::custom(format!(
+                "mode must be \"container\" or \"database\", not {raw:?}"
+            ))),
+        }
+    }
+}
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -73,6 +95,8 @@ struct ServiceFile {
     volume: Option<String>,
     clone: Option<bool>,
     port_range: Option<(u16, u16)>,
+    mode: Option<Mode>,
+    databases: Option<Vec<String>>,
     env: Option<BTreeMap<String, String>>,
     database: Option<String>,
     check_sql: Option<String>,
@@ -113,7 +137,12 @@ pub struct Service {
     pub volume: Option<String>,
     pub clone: bool,
     pub port_range: (u16, u16),
-    /// Values may hold `{port}`, replaced with the clone's host port.
+    pub mode: Mode,
+    /// Source databases to copy in `mode = "database"`; empty means detect the
+    /// one the image's env names.
+    pub databases: Vec<String>,
+    /// Values may hold `{port}`, and in `mode = "database"` also `{database}`
+    /// and `{database:<source>}`.
     pub env: BTreeMap<String, String>,
     pub database: Option<String>,
     /// A query that must succeed on the clone before `up` calls it good.
@@ -219,32 +248,85 @@ fn resolve(file: File, main_root: &Path, path: Option<PathBuf>) -> Result<Config
         (Kind::Redis, file.services.redis),
     ] {
         let Some(entry) = entry else { continue };
-        if entry.database.is_some() && kind != Kind::Postgres {
+        let name = kind.name();
+        let mode = entry.mode.unwrap_or_default();
+
+        if kind == Kind::Redis && mode == Mode::Database {
             bail!(
-                "services.{}.database is only supported for postgres",
-                kind.name()
+                "services.{name}.mode = \"database\" is not supported: Redis has no separate databases to copy (use mode = \"container\")"
             );
+        }
+        if mode == Mode::Database {
+            if let Some(key) = &entry.volume {
+                bail!("services.{name}.volume = {key:?} is not used in mode = \"database\"");
+            }
+            if entry.port_range.is_some() {
+                bail!("services.{name}.port_range is not used in mode = \"database\"");
+            }
+        }
+        if kind != Kind::Postgres && entry.database.is_some() && mode != Mode::Database {
+            bail!("services.{name}.database is only supported for postgres");
         }
         if entry.check_sql.is_some() && kind != Kind::Postgres {
-            bail!(
-                "services.{}.check_sql is only supported for postgres",
-                kind.name()
-            );
+            bail!("services.{name}.check_sql is only supported for postgres");
         }
-        if entry.check_sql.is_some() && entry.database.is_none() {
+
+        let listed = entry.databases.is_some();
+        let databases = match (entry.databases, entry.database.as_ref()) {
+            (Some(_), Some(_)) => {
+                bail!("services.{name}: set either database or databases, not both")
+            }
+            (Some(list), None) => list,
+            (None, Some(db)) => vec![db.clone()],
+            (None, None) => Vec::new(),
+        };
+        if listed && mode != Mode::Database {
+            bail!("services.{name}.databases requires mode = \"database\"");
+        }
+        for db in &databases {
+            if db.contains('}') {
+                bail!("services.{name}.databases: database name {db:?} must not contain \"}}\"");
+            }
+            if db.contains('{') {
+                bail!("services.{name}.databases: database name {db:?} must not contain \"{{\"");
+            }
+        }
+        if listed {
+            if databases.is_empty() {
+                bail!("services.{name}.databases must list at least one database");
+            }
+            for db in &databases {
+                if databases.iter().filter(|d| *d == db).count() > 1 {
+                    bail!("services.{name}.databases must not contain {db:?} twice");
+                }
+            }
+        }
+        if entry.check_sql.is_some() && mode == Mode::Container && entry.database.is_none() {
             bail!("services.postgres.check_sql needs services.postgres.database");
         }
+        // In container mode `database` is only the check target: the volume
+        // copy already carries every logical database.
+        let mut databases = databases;
+        if mode != Mode::Database {
+            databases.clear();
+        }
+
+        let env = entry.env.unwrap_or_else(|| kind.default_env());
+        check_env(name, mode, &databases, &env)?;
+
         let port_range = entry.port_range.unwrap_or(kind.default_port_range());
-        check_range(&format!("services.{}.port_range", kind.name()), port_range)?;
+        check_range(&format!("services.{name}.port_range"), port_range)?;
         services.push(Service {
             kind,
             source: entry
                 .source
-                .unwrap_or_else(|| format!("{project}-{}-1", kind.name())),
+                .unwrap_or_else(|| format!("{project}-{name}-1")),
             volume: entry.volume,
             clone: entry.clone.unwrap_or(true),
             port_range,
-            env: entry.env.unwrap_or_else(|| kind.default_env()),
+            mode,
+            databases,
+            env,
             database: entry.database,
             check_sql: entry.check_sql,
         });
@@ -273,6 +355,77 @@ fn check_range(name: &str, (first, last): (u16, u16)) -> Result<()> {
         bail!("{name} must be [first, last] with 0 < first <= last");
     }
     Ok(())
+}
+
+/// Every `{...}` a value uses must be a placeholder the mode understands, and
+/// a database-mode service must point the app at a copy or it would write into
+/// the source.
+fn check_env(
+    name: &str,
+    mode: Mode,
+    databases: &[String],
+    env: &BTreeMap<String, String>,
+) -> Result<()> {
+    let mut references_a_database = false;
+    for value in env.values() {
+        for token in placeholders(value) {
+            match token.as_str() {
+                "port" => {}
+                "database" => {
+                    if mode != Mode::Database {
+                        bail!(
+                            "services.{name}.env: {{database}} is only available in mode = \"database\""
+                        );
+                    }
+                    references_a_database = true;
+                }
+                _ => {
+                    if let Some(db) = token.strip_prefix("database:") {
+                        if mode != Mode::Database {
+                            bail!(
+                                "services.{name}.env: {{{token}}} is only available in mode = \"database\""
+                            );
+                        }
+                        if db.is_empty() {
+                            bail!("services.{name}.env: placeholder {{{token}}} names no database");
+                        }
+                        if databases.is_empty() {
+                            bail!(
+                                "services.{name}.env references database {db:?} but databases is not set"
+                            );
+                        }
+                        if !databases.iter().any(|d| d == db) {
+                            bail!(
+                                "services.{name}.env references database {db:?} which is not in databases"
+                            );
+                        }
+                        references_a_database = true;
+                    } else {
+                        bail!("services.{name}.env has unknown placeholder {{{token}}}");
+                    }
+                }
+            }
+        }
+    }
+    if mode == Mode::Database && !references_a_database {
+        bail!(
+            "services.{name}.env must reference a database ({{database}} or {{database:<source>}}) so the worktree does not write into the source"
+        );
+    }
+    Ok(())
+}
+
+/// The contents of every `{...}` in a value, in order.
+fn placeholders(value: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = value;
+    while let Some(start) = rest.find('{') {
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('}') else { break };
+        out.push(after[..end].to_string());
+        rest = &after[end + 1..];
+    }
+    out
 }
 
 /// The name docker compose gives the project, so `{project}-postgres-1` finds
@@ -342,9 +495,184 @@ mod tests {
         let pg = cfg.service(Kind::Postgres).unwrap();
         assert_eq!(pg.source, "myapp-postgres-1");
         assert!(pg.clone);
+        assert_eq!(pg.mode, Mode::Container);
+        assert!(pg.databases.is_empty());
+        assert!(pg.database.is_none());
         assert_eq!(pg.port_range, (5433, 5499));
         assert_eq!(pg.env["DB_PORT"], "{port}");
         assert_eq!(pg.env["DB_HOST"], "127.0.0.1");
+    }
+
+    #[test]
+    fn mode_is_container_or_database() {
+        assert_eq!(
+            load("[services.postgres]")
+                .unwrap()
+                .service(Kind::Postgres)
+                .unwrap()
+                .mode,
+            Mode::Container
+        );
+        assert_eq!(
+            load("[services.postgres]\nmode = \"database\"\ndatabases = [\"a\"]\nenv = { U = \"x/{database}\" }")
+                .unwrap()
+                .service(Kind::Postgres)
+                .unwrap()
+                .mode,
+            Mode::Database
+        );
+        let err = format!(
+            "{:#}",
+            load("[services.postgres]\nmode = \"dbs\"").unwrap_err()
+        );
+        assert!(
+            err.contains("must be \"container\" or \"database\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn databases_and_the_database_shortcut() {
+        let cfg = load("[services.postgres]\nmode = \"database\"\ndatabases = [\"a\",\"b\"]\nenv = { U = \"x/{database}\" }").unwrap();
+        assert_eq!(
+            cfg.service(Kind::Postgres).unwrap().databases,
+            vec!["a".to_string(), "b".to_string()]
+        );
+        let cfg = load("[services.postgres]\nmode = \"database\"\ndatabase = \"a\"\nenv = { U = \"x/{database}\" }").unwrap();
+        assert_eq!(cfg.service(Kind::Postgres).unwrap().databases, vec!["a"]);
+        let err = format!(
+            "{:#}",
+            load("[services.postgres]\nmode = \"database\"\ndatabase = \"a\"\ndatabases = [\"b\"]\nenv = { U = \"x/{database}\" }")
+                .unwrap_err()
+        );
+        assert!(err.contains("either database or databases"), "{err}");
+        let err = format!(
+            "{:#}",
+            load("[services.postgres]\nmode = \"database\"\ndatabases = []\nenv = { U = \"x/{database}\" }")
+                .unwrap_err()
+        );
+        assert!(err.contains("must list at least one"), "{err}");
+    }
+
+    #[test]
+    fn rejects_duplicate_databases() {
+        let err = format!(
+            "{:#}",
+            load("[services.postgres]\nmode = \"database\"\ndatabases = [\"a\",\"a\"]\nenv = { U = \"x/{database}\" }")
+                .unwrap_err()
+        );
+        assert!(err.contains("must not contain \"a\" twice"), "{err}");
+    }
+
+    #[test]
+    fn rejects_braces_in_database_names() {
+        let err = format!(
+            "{:#}",
+            load("[services.postgres]\nmode = \"database\"\ndatabases = [\"a}b\"]\nenv = { U = \"x/{database}\" }")
+                .unwrap_err()
+        );
+        assert!(err.contains("must not contain \"}\""), "{err}");
+        let err = format!(
+            "{:#}",
+            load("[services.postgres]\nmode = \"database\"\ndatabases = [\"a{b\"]\nenv = { U = \"x/{database}\" }")
+                .unwrap_err()
+        );
+        assert!(err.contains("must not contain \"{\""), "{err}");
+        let err = format!(
+            "{:#}",
+            load("[services.postgres]\nmode = \"database\"\ndatabase = \"a}b\"\nenv = { U = \"x/{database}\" }")
+                .unwrap_err()
+        );
+        assert!(err.contains("must not contain \"}\""), "{err}");
+        let err = format!(
+            "{:#}",
+            load("[services.postgres]\nmode = \"database\"\ndatabases = [\"a\"]\nenv = { U = \"x/{database:}\" }")
+                .unwrap_err()
+        );
+        assert!(err.contains("names no database"), "{err}");
+    }
+
+    #[test]
+    fn databases_are_database_mode_only_and_mysql_takes_database() {
+        let err = format!(
+            "{:#}",
+            load("[services.postgres]\ndatabases = [\"a\"]").unwrap_err()
+        );
+        assert!(err.contains("requires mode = \"database\""), "{err}");
+        assert!(load("[services.mysql]\ndatabase = \"a\"").is_err());
+        let cfg = load("[services.mysql]\nmode = \"database\"\ndatabase = \"a\"\nenv = { U = \"x/{database}\" }").unwrap();
+        assert_eq!(cfg.service(Kind::Mysql).unwrap().databases, vec!["a"]);
+        let cfg = load(
+            "[services.postgres]\nmode = \"database\"\ndatabase = \"a\"\ncheck_sql = \"select 1\"\nenv = { U = \"x/{database}\" }",
+        )
+        .unwrap();
+        assert!(cfg.service(Kind::Postgres).unwrap().check_sql.is_some());
+    }
+
+    #[test]
+    fn redis_is_container_only() {
+        let err = format!(
+            "{:#}",
+            load("[services.redis]\nmode = \"database\"").unwrap_err()
+        );
+        assert!(err.contains("Redis has no separate databases"), "{err}");
+        assert!(err.contains("mode = \"container\""), "{err}");
+    }
+
+    #[test]
+    fn database_mode_takes_no_volume_or_range() {
+        let err = format!(
+            "{:#}",
+            load("[services.postgres]\nmode = \"database\"\nvolume = \"x\"").unwrap_err()
+        );
+        assert!(err.contains("is not used in mode = \"database\""), "{err}");
+        let err = format!(
+            "{:#}",
+            load("[services.postgres]\nmode = \"database\"\nport_range = [5433, 5499]")
+                .unwrap_err()
+        );
+        assert!(err.contains("is not used in mode = \"database\""), "{err}");
+    }
+
+    #[test]
+    fn database_mode_env_names_a_database() {
+        let err = format!(
+            "{:#}",
+            load("[services.postgres]\nmode = \"database\"\ndatabases = [\"a\"]\nenv = { DB_HOST = \"127.0.0.1\" }")
+                .unwrap_err()
+        );
+        assert!(err.contains("must reference a database"), "{err}");
+        assert!(
+            load("[services.postgres]\nmode = \"database\"\ndatabases = [\"a\"]\nenv = { URL = \"x/{database}\" }")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn unknown_database_placeholders_are_errors() {
+        let err = format!(
+            "{:#}",
+            load("[services.postgres]\nmode = \"database\"\ndatabases = [\"a\"]\nenv = { U = \"x/{database:nope}\" }")
+                .unwrap_err()
+        );
+        assert!(
+            err.contains("nope") && err.contains("is not in databases"),
+            "{err}"
+        );
+        let err = format!(
+            "{:#}",
+            load("[services.postgres]\nmode = \"database\"\ndatabases = [\"a\"]\nenv = { U = \"x/{databases}\" }")
+                .unwrap_err()
+        );
+        assert!(err.contains("unknown placeholder"), "{err}");
+        let err = format!(
+            "{:#}",
+            load("[services.postgres]\nenv = { U = \"x/{database}\" }").unwrap_err()
+        );
+        assert!(
+            err.contains("only available in mode = \"database\""),
+            "{err}"
+        );
     }
 
     #[test]
@@ -379,8 +707,12 @@ mod tests {
     }
 
     #[test]
-    fn database_is_postgres_only() {
+    fn database_in_mysql_needs_database_mode() {
         assert!(load("[services.mysql]\ndatabase = \"x\"").is_err());
+        assert!(
+            load("[services.mysql]\nmode = \"database\"\ndatabase = \"x\"\nenv = { U = \"x/{database}\" }")
+                .is_ok()
+        );
         assert!(load("[services.postgres]\ndatabase = \"x\"").is_ok());
     }
 
@@ -424,6 +756,18 @@ mod tests {
     }
 
     #[test]
+    fn rails_database_example_loads() {
+        let cfg = load(include_str!("../examples/rails-postgres-database.wt.toml")).unwrap();
+        let pg = cfg.service(Kind::Postgres).unwrap();
+        assert_eq!(pg.mode, Mode::Database);
+        assert_eq!(
+            pg.databases,
+            vec!["myapp_development".to_string(), "myapp_cache".to_string()]
+        );
+        assert_eq!(cfg.app.copy, vec!["storage"]);
+    }
+
+    #[test]
     fn refresh_must_not_overlap_copy() {
         let cfg = load("[app]\ncopy = [\"storage\"]\nrefresh = [\".claude/agents\"]").unwrap();
         assert_eq!(cfg.app.refresh, vec![".claude/agents"]);
@@ -435,6 +779,12 @@ mod tests {
     #[test]
     fn check_sql_is_postgres_only_and_needs_a_database() {
         let ok = "[services.postgres]\ndatabase = \"d\"\ncheck_sql = \"select 1\"";
+        assert_eq!(
+            load(ok).unwrap().service(Kind::Postgres).unwrap().check_sql,
+            Some("select 1".into())
+        );
+        // `databases[0]` is the primary, so the check needs no `database` key.
+        let ok = "[services.postgres]\nmode = \"database\"\ndatabases = [\"a\"]\ncheck_sql = \"select 1\"\nenv = { U = \"x/{database}\" }";
         assert_eq!(
             load(ok).unwrap().service(Kind::Postgres).unwrap().check_sql,
             Some("select 1".into())

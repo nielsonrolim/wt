@@ -22,6 +22,18 @@ pub struct Container {
     #[serde(default)]
     pub mounts: Vec<Mount>,
     pub host_config: HostConfig,
+    /// The effective port bindings. With an ephemeral host port (compose's
+    /// `127.0.0.1::5432`), `HostConfig` keeps an empty `HostPort` and only this
+    /// section carries the port Docker actually assigned.
+    #[serde(default)]
+    pub network_settings: NetworkSettings,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(rename_all = "PascalCase")]
+pub struct NetworkSettings {
+    #[serde(default)]
+    pub ports: Option<HashMap<String, Option<Vec<PortBinding>>>>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -133,11 +145,32 @@ impl Container {
         ports.into_iter().min()
     }
 
+    /// The host port published for one container port, if any. The effective
+    /// `NetworkSettings` wins: an ephemeral host port lives only there.
+    pub fn host_port(&self, container_port: u16) -> Option<u16> {
+        let key = format!("{container_port}/tcp");
+        let read = |bindings: &HashMap<String, Option<Vec<PortBinding>>>| {
+            bindings
+                .get(&key)?
+                .as_ref()?
+                .first()?
+                .host_port
+                .parse()
+                .ok()
+        };
+        self.network_settings
+            .ports
+            .as_ref()
+            .and_then(read)
+            .or_else(|| self.host_config.port_bindings.as_ref().and_then(read))
+    }
+
     fn bindings(&self) -> impl Iterator<Item = (&String, &Vec<PortBinding>)> {
         self.host_config
             .port_bindings
             .iter()
             .flatten()
+            .chain(self.network_settings.ports.iter().flatten())
             .filter_map(|(k, v)| v.as_ref().map(|bs| (k, bs)))
     }
 
@@ -328,6 +361,22 @@ pub fn exec_output(container: &str, argv: &[&str]) -> Option<String> {
     sh::output(docker().args(["exec", container]).args(argv)).ok()
 }
 
+/// `docker exec`, with the error (and the container's stderr) on failure.
+pub fn exec(container: &str, argv: &[&str]) -> Result<String> {
+    sh::output(docker().args(["exec", container]).args(argv))
+}
+
+/// `docker exec` with environment variables; used to hand MySQL its password
+/// without putting it on the command line.
+pub fn exec_env(container: &str, env: &[(&str, &str)], argv: &[&str]) -> Result<String> {
+    let mut cmd = docker();
+    cmd.arg("exec");
+    for (k, v) in env {
+        cmd.arg("-e").arg(format!("{k}={v}"));
+    }
+    sh::output(cmd.arg(container).args(argv))
+}
+
 pub fn logs_tail(container: &str) -> String {
     let out = Command::new("docker")
         .args(["logs", "--tail", "30", container])
@@ -411,6 +460,30 @@ mod tests {
         let c = with_bindings(r#"{"3306/tcp": [{"HostPort": "3306"}]}"#);
         assert_eq!(c.shm_size(), 0);
         assert!(c.ulimits().is_empty());
+    }
+
+    #[test]
+    fn host_port_reads_the_binding() {
+        let c = with_bindings(r#"{"5432/tcp": [{"HostPort": "55432"}]}"#);
+        assert_eq!(c.host_port(5432), Some(55432));
+        assert_eq!(c.host_port(5433), None);
+        assert_eq!(with_bindings("null").host_port(5432), None);
+        // Chosen by container port, not by map order.
+        let c = with_bindings(
+            r#"{"3306/tcp": [{"HostPort": "33061"}], "33060/tcp": [{"HostPort": "33071"}]}"#,
+        );
+        assert_eq!(c.host_port(3306), Some(33061));
+    }
+
+    #[test]
+    fn host_port_reads_the_effective_binding() {
+        let json = r#"[{"Name": "/x", "Config": {"Image": "postgres"}, "State": {"Running": true},
+            "Mounts": [], "HostConfig": {"PortBindings": {"5432/tcp": [{"HostPort": ""}]}},
+            "NetworkSettings": {"Ports": {"5432/tcp": [{"HostPort": "32779"}]}}}]"#;
+        let c: Vec<Container> = serde_json::from_str(json).unwrap();
+        assert_eq!(c[0].host_port(5432), Some(32779));
+        assert_eq!(c[0].host_ports(), vec![32779]);
+        assert_eq!(c[0].container_port(5432), Some(5432));
     }
 
     #[test]
