@@ -685,6 +685,25 @@ for status in shared partial no-db; do
 done
 "$WT" down db/ls1 --yes >/dev/null
 
+step "database mode: ls says unknown while the source is stopped"
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[services.postgres]
+mode = "database"
+databases = ["app", "app_cache"]
+env = { DATABASE_URL = "postgres://app:app@127.0.0.1:{port}/{database}", CACHE_URL = "postgres://app:app@127.0.0.1:{port}/{database:app_cache}" }
+EOF
+"$WT" up db/uncertain >/dev/null
+docker stop "$PROJECT-postgres-1" >/dev/null
+"$WT" ls >"$WORK/ls-source-down.log"
+awk -v s=db-uncertain '$1==s {for(i=1;i<=NF;i++) if($i=="unknown") ok=1} END{exit !ok}' "$WORK/ls-source-down.log" || fail "ls must be unknown with the source stopped"
+docker start "$PROJECT-postgres-1" >/dev/null
+HOST="$(docker port "$PROJECT-postgres-1" 5432/tcp | sed 's/.*://')"
+"$WT" ls >"$WORK/ls-source-up.log"
+awk -v s=db-uncertain '$1==s {for(i=1;i<=NF;i++) if($i=="shared") ok=1} END{exit !ok}' "$WORK/ls-source-up.log" || fail "ls must be shared after the source returns"
+"$WT" down db/uncertain --yes >/dev/null
+
 step "database mode: ls says unknown and down keeps the state without Docker"
 mkdir -p "$WORK/fakebin"
 printf '#!/bin/sh\nexit 1\n' >"$WORK/fakebin/docker"

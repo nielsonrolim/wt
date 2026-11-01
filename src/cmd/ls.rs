@@ -177,19 +177,27 @@ fn status(
 }
 
 /// Whether the registered copies still exist. One query per copy, and only
-/// when the worktree has no container of its own.
+/// when the worktree has no container of its own. A stopped source (or a
+/// probe that fails) means "cannot tell", never "the copies are gone".
 fn database_status(state: &State) -> Option<&'static str> {
     if state.databases.is_empty() {
         return None;
     }
-    let existing = state
-        .databases
-        .iter()
-        .filter(|copy| {
-            docker::container(&copy.source)
-                .is_some_and(|container| database::exists(copy, &container).unwrap_or(false))
-        })
-        .count();
+    let mut existing = 0;
+    for copy in &state.databases {
+        // A missing source container took its databases with it.
+        let Some(container) = docker::container(&copy.source) else {
+            continue;
+        };
+        if !container.state.running {
+            return Some("unknown");
+        }
+        match database::exists(copy, &container) {
+            Ok(true) => existing += 1,
+            Ok(false) => {}
+            Err(_) => return Some("unknown"),
+        }
+    }
     Some(match existing {
         n if n == state.databases.len() => "shared",
         0 => "no-db",

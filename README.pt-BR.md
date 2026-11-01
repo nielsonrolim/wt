@@ -91,10 +91,10 @@ feat-x  feat/x  3001  5433      6380   running  47.69MB+109B
 | `shared` | sem container; todos os bancos copiados registrados no estado existem |
 | `no-db` | checkout sem containers nem bancos copiados (`wt up <branch>` cria) |
 | `ready` | projeto sem serviços, checkout presente |
-| `unknown` | Docker inalcançável e a worktree tem bancos copiados, então o `ls` não sabe dizer |
+| `unknown` | Docker inalcançável, ou uma instância de origem parada, e a worktree tem bancos copiados, então o `ls` não sabe dizer |
 | `orphan` | sobraram recursos, mas o checkout sumiu (`wt down <slug>`) |
 
-`orphan` vem do sistema de arquivos e vence `unknown`; um container da worktree vence o veredito de banco. O `wt ls` nunca muda nada.
+`orphan` vem do sistema de arquivos e vence `unknown`; um container da worktree vence o veredito de banco, e uma origem parada reporta `unknown` em vez de `no-db`. O `wt ls` nunca muda nada.
 
 ### `wt init [--force]`
 
