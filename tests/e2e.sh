@@ -38,6 +38,7 @@ cleanup() {
       -e "drop database $db" >/dev/null 2>&1
   done
   for id in $(docker ps -aq --filter "label=wt.project=$PROJECT"); do docker rm -f "$id" >/dev/null; done
+docker rm -f "$PROJECT-helper" >/dev/null 2>&1
   for v in $(docker volume ls -q --filter "label=wt.project=$PROJECT"); do docker volume rm -f "$v" >/dev/null; done
   (cd "$REPO" 2>/dev/null && docker compose down -v >/dev/null 2>&1)
   if [ "${KEEP:-}" = 1 ]; then echo "kept $WORK"; else rm -rf "$WORK"; fi
@@ -227,6 +228,20 @@ grep -q '^LOCAL=1$' "$WTP/.env" || fail "hand edit lost"
 [ "$(grep -c 'Written by wt up' "$WTP/.env")" = 1 ] || fail "banner stacked"
 [ "$RERUN_STARTED" = "$(docker inspect -f '{{.State.StartedAt}}' "$PROJECT-postgres-1")" ] ||
   fail "a re-run must not touch the source"
+
+step "a half-copied volume held by a helper is discarded"
+# Reproduce the Ctrl-C race without a signal: a container still mounts the
+# volume when the half-copy is discarded.
+docker run --rm -v "$PROJECT-wt-feat-x-postgres-data:/v" --entrypoint sh \
+  postgres:16.7-alpine -euc 'rm -f /v/.wt-clone-complete'
+docker run -d --name "$PROJECT-helper" -v "$PROJECT-wt-feat-x-postgres-data:/v" \
+  postgres:16.7-alpine sleep 120 >/dev/null
+"$WT" up feat/x >"$WORK/discard.log" 2>&1
+grep -q 'Discarding half-copied' "$WORK/discard.log" || fail "half-copied volume was not discarded"
+docker inspect "$PROJECT-helper" >/dev/null 2>&1 && fail "the helper holding the volume survived"
+[ "$(docker run --rm -v "$PROJECT-wt-feat-x-postgres-data:/v" --entrypoint sh \
+  postgres:16.7-alpine -euc 'test -f /v/.wt-clone-complete && echo yes')" = yes ] ||
+  fail "the recopied volume has no marker"
 
 step "a branch with the same slug is refused"
 "$WT" up feat-x 2>/dev/null && fail "feat-x reused feat/x's worktree"
