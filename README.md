@@ -91,10 +91,10 @@ feat-x  feat/x  3001  5433      6380   running  47.69MB+109B
 | `shared` | no container; every database copy registered in the state exists |
 | `no-db` | checkout without containers or database copies (`wt up <branch>` creates them) |
 | `ready` | project without services, checkout present |
-| `unknown` | Docker is unreachable and the worktree has database copies, so `ls` cannot tell |
+| `unknown` | Docker is unreachable, or a source instance is stopped, and the worktree has database copies, so `ls` cannot tell |
 | `orphan` | resources left behind, checkout gone (`wt down <slug>`) |
 
-`orphan` is decided from the filesystem and wins over `unknown`; a container of the worktree wins over the database verdict. `wt ls` never changes anything.
+`orphan` is decided from the filesystem and wins over `unknown`; a container of the worktree wins over the database verdict, and a stopped source reports `unknown` rather than `no-db`. `wt ls` never changes anything.
 
 ### `wt init [--force]`
 

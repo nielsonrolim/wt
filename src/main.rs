@@ -61,8 +61,8 @@ enum Command {
     /// STATUS: running (all containers up), partial, stopped, shared (no
     /// container; every copied database exists), no-db (checkout without
     /// containers or copies), ready (project without services), unknown
-    /// (Docker unreachable with copies), orphan (resources left behind,
-    /// checkout gone: wt down <slug>).
+    /// (Docker unreachable or a source stopped, with copies), orphan
+    /// (resources left behind, checkout gone: wt down <slug>).
     #[command(visible_alias = "list")]
     Ls,
     /// Write a .wt.toml from the repo's compose containers and toolchain
