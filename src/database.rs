@@ -4,10 +4,11 @@
 //! same job the Docker labels do for containers and volumes.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result, bail};
 
-use crate::config::Service;
+use crate::config::{Service, map_placeholders};
 use crate::docker::{self, Container};
 use crate::project::Env;
 use crate::services::ContainerSource;
@@ -153,8 +154,13 @@ pub fn parse_pg_marker(text: &str) -> Option<Marker> {
 pub enum MarkerState {
     /// The target does not exist.
     Missing,
-    /// It exists but carries no marker of ours: never dropped without --force.
+    /// Its marker names another project or slug: never dropped without --force.
     Foreign,
+    /// It exists with no marker at all. App tasks such as `db:reset` erase the
+    /// marker, so this is ours only when the state also lists the target.
+    Unmarked,
+    /// Unmarked but registered, and it holds tables: keep it, restore the marker.
+    Adopt,
     /// Ours, but the copy never finished: drop and copy again.
     Recreate,
     /// Ours and finished: reuse.
@@ -170,34 +176,48 @@ pub fn classify_marker(comment: Option<&str>, project: &str, slug: &str) -> Mark
                 MarkerState::Recreate
             }
         }
-        _ => MarkerState::Foreign,
+        Some(_) => MarkerState::Foreign,
+        // An empty or unrelated comment is not a claim by anyone else.
+        None => MarkerState::Unmarked,
     }
 }
 
 /// The `__wt_meta` rows are the label of a MySQL copy. A missing table is
-/// `None`, which is foreign; an extra key is ignored.
+/// `None`, which is unmarked; an extra key is ignored.
 pub fn classify_mysql_marker(
     rows: Option<&BTreeMap<String, String>>,
     project: &str,
     slug: &str,
 ) -> MarkerState {
     let Some(rows) = rows else {
-        return MarkerState::Foreign;
+        return MarkerState::Unmarked;
     };
-    match (
-        rows.get("wt.project"),
-        rows.get("wt.slug"),
-        rows.get("wt.complete"),
-    ) {
-        (Some(p), Some(s), Some(c)) if p == project && s == slug => {
+    let (found_project, found_slug) = (rows.get("wt.project"), rows.get("wt.slug"));
+    if found_project.is_some_and(|p| p != project) || found_slug.is_some_and(|s| s != slug) {
+        return MarkerState::Foreign;
+    }
+    match (found_project, found_slug, rows.get("wt.complete")) {
+        (Some(_), Some(_), Some(c)) => {
             if c == "1" {
                 MarkerState::Reuse
             } else {
                 MarkerState::Recreate
             }
         }
-        _ => MarkerState::Foreign,
+        _ => MarkerState::Unmarked,
     }
+}
+
+/// Whether the state lists exactly this copy. Together with `plan`, which never
+/// lets a foreign target reach the state, that makes an unmarked target ours.
+pub fn is_registered(previous: &[DatabaseCopy], copy: &DatabaseCopy) -> bool {
+    previous.contains(copy)
+}
+
+/// A state file can be stale or edited, so an unmarked target also has to carry
+/// the name wt would give this source database in this worktree.
+pub fn has_own_name(copy: &DatabaseCopy, project: &str, slug: &str) -> bool {
+    target_name(project, slug, &copy.source_db) == copy.target
 }
 
 // ---------------------------------------------------------------------------
@@ -235,13 +255,48 @@ fn dump_file(target: &str) -> String {
 /// Dump to a file and restore from it, so `set -e` sees the dump's exit code.
 /// No pipe and no `set -o pipefail`: the shell inside the image may not have it,
 /// and a failed dump would otherwise still report success.
-pub fn pg_copy_script(origin: &str, target: &str, user: &str) -> String {
+///
+/// `docker exec` does not end with its client, so a Ctrl-C leaves this running.
+/// The script records its pid for `stop_script`, and runs each step in the
+/// background so a signal reaches the `wait` and the trap ends the step too.
+fn copy_script(target: &str, setup: &str, dump: &str, restore: &str) -> String {
     let file = dump_file(target);
     format!(
-        "f={file}\ntrap 'rm -f {file}' 0 1 2 15\npg_dump -U {user} -d {origin} > \"$f\" && psql -v ON_ERROR_STOP=1 -U {user} -d {target} < \"$f\"",
-        user = shell_quote(user),
-        origin = shell_quote(origin),
-        target = shell_quote(target),
+        "f={file}\necho $$ > \"$f.pid\"\nchild=\ntrap 'if [ -n \"$child\" ]; then kill \"$child\" 2>/dev/null || true; fi; rm -f \"$f\" \"$f.pid\"' 0\ntrap 'exit 143' 1 2 15\n{setup}{dump} > \"$f\" &\nchild=$!\nwait \"$child\"\n{restore} < \"$f\" &\nchild=$!\nwait \"$child\"\nchild=\n"
+    )
+}
+
+pub fn pg_copy_script(origin: &str, target: &str, user: &str) -> String {
+    let user = shell_quote(user);
+    copy_script(
+        target,
+        "",
+        &format!("pg_dump -U {user} -d {}", shell_quote(origin)),
+        &format!(
+            "psql -v ON_ERROR_STOP=1 -U {user} -d {}",
+            shell_quote(target)
+        ),
+    )
+}
+
+/// Ends a copy script a previous run left behind and waits until it is gone:
+/// it would otherwise delete the new run's dump or restore into the new target.
+/// The command line is checked because a stale pid file may name a reused pid.
+pub fn stop_script(target: &str) -> String {
+    let file = dump_file(target);
+    format!(
+        r#"f={file}
+p=$(cat "$f.pid" 2>/dev/null || true)
+[ -n "$p" ] || exit 0
+i=0
+while grep -qF "$f" "/proc/$p/cmdline" 2>/dev/null; do
+  [ "$i" -lt 30 ] || {{ echo "copy script $p did not stop" >&2; exit 1; }}
+  kill -TERM "$p" 2>/dev/null || true
+  i=$((i+1))
+  sleep 1
+done
+rm -f "$f" "$f.pid"
+"#
     )
 }
 
@@ -266,34 +321,50 @@ pub fn mysql_dump_args(version: &str) -> Vec<String> {
 
 pub fn mysql_copy_script(origin: &str, target: &str, version: &str) -> String {
     let args = mysql_dump_args(version).join(" ");
-    let file = dump_file(target);
-    format!(
-        "f={file}\ntrap 'rm -f {file}' 0 1 2 15\ndump=$(command -v mysqldump || command -v mariadb-dump)\ncli=$(command -v mysql || command -v mariadb)\n\"$dump\" {args} {origin} > \"$f\" && \"$cli\" {target} < \"$f\"",
-        origin = shell_quote(origin),
-        target = shell_quote(target),
+    copy_script(
+        target,
+        "dump=$(command -v mysqldump || command -v mariadb-dump)\ncli=$(command -v mysql || command -v mariadb)\n",
+        // Never the source's `__wt_meta`: restoring it would replace the target's
+        // `complete=0`, and an interrupted restore would pass for a reset copy.
+        &format!(
+            "\"$dump\" -uroot {args} {} {}",
+            shell_quote(&format!("--ignore-table={origin}.__wt_meta")),
+            shell_quote(origin)
+        ),
+        &format!("\"$cli\" -uroot {}", shell_quote(target)),
     )
 }
 
 /// Replaces `{port}` and, in database mode, `{database}` and
-/// `{database:<source>}`. Config validation already rejected anything else.
+/// `{database:<source>}`. Config validation already rejected anything else, and
+/// reads a value with the same tokenizer, so other braces stay literal here.
 pub fn render_env(
     values: &[(String, String)],
     targets: &[(String, String)],
     port: u16,
 ) -> Result<Vec<(String, String)>> {
-    let primary = targets
-        .first()
-        .map(|(_, target)| target.as_str())
-        .unwrap_or_default();
     let mut out = Vec::new();
     for (key, value) in values {
-        let mut text = value.replace("{port}", &port.to_string());
-        for (source, target) in targets {
-            text = text.replace(&format!("{{database:{source}}}"), target);
-        }
-        text = text.replace("{database}", primary);
-        if text.contains("{database") {
-            bail!("services.env value {key} has an unresolved {{database}} placeholder");
+        let mut unresolved = None;
+        let text = map_placeholders(value, |token| {
+            let found = match token {
+                "port" => return Some(port.to_string()),
+                "database" => targets.first().map(|(_, target)| target.clone()),
+                _ => {
+                    let source = token.strip_prefix("database:")?;
+                    targets
+                        .iter()
+                        .find(|(name, _)| name == source)
+                        .map(|(_, target)| target.clone())
+                }
+            };
+            if found.is_none() {
+                unresolved = Some(token.to_string());
+            }
+            found
+        });
+        if let Some(token) = unresolved {
+            bail!("services.env value {key} has an unresolved {{{token}}} placeholder");
         }
         out.push((key.clone(), text));
     }
@@ -315,9 +386,9 @@ pub fn reconcile(previous: &[DatabaseCopy], desired: &[(DatabaseCopy, MarkerStat
     for (copy, state) in desired {
         match state {
             MarkerState::Missing => out.create.push(copy.clone()),
-            MarkerState::Reuse => out.reuse.push(copy.clone()),
+            MarkerState::Reuse | MarkerState::Adopt => out.reuse.push(copy.clone()),
             MarkerState::Recreate => out.recreate.push(copy.clone()),
-            MarkerState::Foreign => {}
+            MarkerState::Foreign | MarkerState::Unmarked => {}
         }
     }
     let wanted: BTreeSet<(&str, &str, &str)> = desired
@@ -384,30 +455,41 @@ fn pg_env(container: &Container) -> Vec<(&str, &str)> {
 }
 
 fn pg_query(container: &Container, user: &str, database: &str, sql: &str) -> Result<String> {
-    docker::exec_env(
-        container.name(),
-        &pg_env(container),
-        &[
-            "psql",
-            "-qtAX",
-            "-F",
-            "\t",
-            "-v",
-            "ON_ERROR_STOP=1",
-            "-U",
-            user,
-            "-d",
-            database,
-            "-c",
-            sql,
-        ],
-    )
+    pg_session(container, user, database, &[sql])
+}
+
+/// One psql session running each statement on its own, outside a transaction,
+/// which is what `CREATE DATABASE` and `DROP DATABASE` require.
+fn pg_session(
+    container: &Container,
+    user: &str,
+    database: &str,
+    statements: &[&str],
+) -> Result<String> {
+    let mut argv = vec![
+        "psql",
+        "-qtAX",
+        "-F",
+        "\t",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-U",
+        user,
+        "-d",
+        database,
+    ];
+    for sql in statements {
+        argv.extend(["-c", sql]);
+    }
+    docker::exec_env(container.name(), &pg_env(container), &argv)
 }
 
 fn pg_exec(container: &Container, user: &str, database: &str, sql: &str) -> Result<()> {
     pg_query(container, user, database, sql).map(drop)
 }
 
+/// `-uroot` because the env holds root's password: without it the client logs
+/// in as the exec user, which fails on a source that sets `user:`.
 fn mysql_exec(container: &Container, sql: &str) -> Result<()> {
     docker::exec_env(
         container.name(),
@@ -415,7 +497,7 @@ fn mysql_exec(container: &Container, sql: &str) -> Result<()> {
         &[
             "sh",
             "-c",
-            "cli=$(command -v mysql || command -v mariadb); \"$cli\" -N -B -e \"$1\"",
+            "cli=$(command -v mysql || command -v mariadb); \"$cli\" -uroot -N -B -e \"$1\"",
             "wt",
             sql,
         ],
@@ -430,7 +512,7 @@ fn mysql_query(container: &Container, database: &str, sql: &str) -> Result<Strin
         &[
             "sh",
             "-c",
-            "cli=$(command -v mysql || command -v mariadb); \"$cli\" -N -B \"$1\" -e \"$2\"",
+            "cli=$(command -v mysql || command -v mariadb); \"$cli\" -uroot -N -B \"$1\" -e \"$2\"",
             "wt",
             database,
             sql,
@@ -522,6 +604,28 @@ fn mysql_state(
     Ok(classify_mysql_marker(rows.as_ref(), project, slug))
 }
 
+/// Whether the target holds anything an app put there. `__wt_meta` does not count.
+fn has_tables(svc: &Service, container: &Container, target: &str) -> Result<bool> {
+    let count = match svc.kind {
+        crate::services::Kind::Postgres => pg_query(
+            container,
+            pg_user(container),
+            target,
+            "SELECT COUNT(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg_toast%'",
+        )?,
+        crate::services::Kind::Mysql => mysql_query(
+            container,
+            "information_schema",
+            &format!(
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = {} AND table_name <> '__wt_meta'",
+                mysql_lit(target)
+            ),
+        )?,
+        crate::services::Kind::Redis => unreachable!(),
+    };
+    Ok(count.trim() != "0")
+}
+
 /// The marker state of an existing copy, for `down` and `ls`.
 pub fn state_of(
     copy: &DatabaseCopy,
@@ -605,6 +709,7 @@ pub fn plan(
     svc: &Service,
     src: &ContainerSource,
     env: &Env,
+    previous: &[DatabaseCopy],
 ) -> Result<Vec<(DatabaseCopy, MarkerState)>> {
     if !src.container.state.running {
         bail!(
@@ -637,22 +742,32 @@ pub fn plan(
             }
             crate::services::Kind::Redis => unreachable!(),
         };
-        if state == MarkerState::Foreign {
-            bail!(
-                "{target} was not created by wt for {}/{}; drop it by hand before retrying",
+        let copy = DatabaseCopy {
+            service: svc.kind.name().to_string(),
+            source: src.container.name().to_string(),
+            source_db,
+            target,
+        };
+        let state = match state {
+            MarkerState::Unmarked if is_registered(previous, &copy) => {
+                // An empty target is an interrupted create or a recreated
+                // database: nothing to lose, and stamping it complete would
+                // pass an empty copy off as a finished one.
+                if has_tables(svc, &src.container, &copy.target)? {
+                    MarkerState::Adopt
+                } else {
+                    MarkerState::Recreate
+                }
+            }
+            MarkerState::Unmarked | MarkerState::Foreign => bail!(
+                "{} was not created by wt for {}/{}; drop it by hand before retrying",
+                copy.target,
                 env.project,
                 env.slug
-            );
-        }
-        out.push((
-            DatabaseCopy {
-                service: svc.kind.name().to_string(),
-                source: src.container.name().to_string(),
-                source_db,
-                target,
-            },
-            state,
-        ));
+            ),
+            other => other,
+        };
+        out.push((copy, state));
     }
     Ok(out)
 }
@@ -680,8 +795,25 @@ pub fn prepare(
                 drop_copy(copy, &src.container)?;
                 create(svc, src, env, copy)?;
             }
+            MarkerState::Adopt => {
+                eprintln!(
+                    "warning: {} lost its wt marker (a database reset does that); keeping its data and restoring the marker",
+                    copy.target
+                );
+                match svc.kind {
+                    crate::services::Kind::Postgres => {
+                        mark_complete(&src.container, copy, env, true)?;
+                    }
+                    crate::services::Kind::Mysql => {
+                        mysql_marker(&src.container, env, copy, true)?;
+                        grant_mysql(&src.container, &copy.target)?;
+                    }
+                    crate::services::Kind::Redis => unreachable!(),
+                }
+                println!("Reusing {}", copy.target);
+            }
             MarkerState::Missing => create(svc, src, env, copy)?,
-            MarkerState::Foreign => bail!(
+            MarkerState::Foreign | MarkerState::Unmarked => bail!(
                 "{} was not created by wt for {}/{}",
                 copy.target,
                 env.project,
@@ -717,16 +849,14 @@ fn create_postgres(
         sql_lit(&collate),
         sql_lit(&ctype)
     );
-    pg_exec(container, user, "postgres", &create)?;
-    mark_complete(container, copy, env, false)?;
+    // One session, so an interrupted `wt` cannot split the two: the session
+    // finishes inside the container even after its client is gone.
+    let comment = pg_comment_sql(copy, env, false);
+    pg_session(container, user, "postgres", &[&create, &comment])?;
     if svc.clone {
         let script = pg_copy_script(&copy.source_db, &copy.target, user);
-        docker::exec_env(
-            container.name(),
-            &pg_env(container),
-            &["sh", "-euc", &script],
-        )
-        .with_context(|| format!("copying {} into {}", copy.source_db, copy.target))?;
+        run_copy(container, &pg_env(container), &copy.target, &script)
+            .with_context(|| format!("copying {} into {}", copy.source_db, copy.target))?;
     }
     mark_complete(container, copy, env, true)?;
     println!(
@@ -799,23 +929,21 @@ fn create_mysql(
     let container = &src.container;
     let target = sql_backtick(&copy.target);
     let (charset, collation) = mysql_metadata(container, &copy.source_db)?;
+    // One client run, so an interrupted `wt` cannot split the database from its
+    // marker: the client finishes inside the container after `wt` is gone.
     mysql_exec(
         container,
-        &format!("CREATE DATABASE {target} CHARACTER SET {charset} COLLATE {collation}"),
+        &format!(
+            "CREATE DATABASE {target} CHARACTER SET {charset} COLLATE {collation}; {}",
+            mysql_marker_sql(env, copy, false)
+        ),
     )?;
-    mysql_marker(container, env, copy, false)?;
     if svc.clone {
         let version = mysql_version(container)?;
         let script = mysql_copy_script(&copy.source_db, &copy.target, &version);
-        docker::exec_env(
-            container.name(),
-            &mysql_env(container),
-            &["sh", "-euc", &script],
-        )
-        .with_context(|| format!("copying {} into {}", copy.source_db, copy.target))?;
+        run_copy(container, &mysql_env(container), &copy.target, &script)
+            .with_context(|| format!("copying {} into {}", copy.source_db, copy.target))?;
     }
-    // Rewritten after the restore: a source `__wt_meta` table would come with
-    // the dump and replace the marker created above.
     mysql_marker(container, env, copy, true)?;
     grant_mysql(container, &copy.target)?;
     println!(
@@ -834,25 +962,16 @@ fn mysql_marker(
     copy: &DatabaseCopy,
     complete: bool,
 ) -> Result<()> {
+    mysql_exec(container, &mysql_marker_sql(env, copy, complete))
+}
+
+fn mysql_marker_sql(env: &Env, copy: &DatabaseCopy, complete: bool) -> String {
     let target = sql_backtick(&copy.target);
-    mysql_exec(
-        container,
-        &format!("DROP TABLE IF EXISTS {target}.__wt_meta"),
-    )?;
-    mysql_exec(
-        container,
-        &format!(
-            "CREATE TABLE {target}.__wt_meta (k VARCHAR(64) PRIMARY KEY, v VARCHAR(255) NOT NULL)"
-        ),
-    )?;
-    mysql_exec(
-        container,
-        &format!(
-            "INSERT INTO {target}.__wt_meta (k, v) VALUES ('wt.project', {}), ('wt.slug', {}), ('wt.complete', {})",
-            mysql_lit(&env.project),
-            mysql_lit(&env.slug),
-            mysql_lit(if complete { "1" } else { "0" })
-        ),
+    format!(
+        "DROP TABLE IF EXISTS {target}.__wt_meta; CREATE TABLE {target}.__wt_meta (k VARCHAR(64) PRIMARY KEY, v VARCHAR(255) NOT NULL); INSERT INTO {target}.__wt_meta (k, v) VALUES ('wt.project', {}), ('wt.slug', {}), ('wt.complete', {})",
+        mysql_lit(&env.project),
+        mysql_lit(&env.slug),
+        mysql_lit(if complete { "1" } else { "0" })
     )
 }
 
@@ -879,40 +998,101 @@ fn mark_complete(
     env: &Env,
     complete: bool,
 ) -> Result<()> {
-    let user = pg_user(container);
     pg_exec(
         container,
-        user,
+        pg_user(container),
         "postgres",
-        &format!(
-            "COMMENT ON DATABASE {} IS {}",
-            sql_ident(&copy.target),
-            sql_lit(&pg_marker(&env.project, &env.slug, complete))
-        ),
+        &pg_comment_sql(copy, env, complete),
     )
+}
+
+fn pg_comment_sql(copy: &DatabaseCopy, env: &Env, complete: bool) -> String {
+    format!(
+        "COMMENT ON DATABASE {} IS {}",
+        sql_ident(&copy.target),
+        sql_lit(&pg_marker(&env.project, &env.slug, complete))
+    )
+}
+
+/// Copy scripts in flight, for the Ctrl-C handler.
+struct Copies {
+    aborted: bool,
+    active: Vec<(String, String)>,
+}
+
+static COPIES: Mutex<Copies> = Mutex::new(Copies {
+    aborted: false,
+    active: Vec::new(),
+});
+
+fn copies() -> MutexGuard<'static, Copies> {
+    COPIES.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Runs a copy script inside the source, registered so Ctrl-C can end it.
+fn run_copy(container: &Container, env: &[(&str, &str)], target: &str, script: &str) -> Result<()> {
+    let entry = (container.name().to_string(), target.to_string());
+    {
+        let mut copies = copies();
+        if copies.aborted {
+            bail!("interrupted");
+        }
+        copies.active.push(entry.clone());
+    }
+    let result = docker::exec_env(container.name(), env, &["sh", "-euc", script]);
+    copies().active.retain(|active| active != &entry);
+    result.map(drop)
+}
+
+/// Ends the copy scripts of this run. The target keeps `complete=0`, so the next
+/// `up` drops and copies it again; that drop also catches a script this missed.
+pub fn abort_copies() {
+    let active: Vec<(String, String)> = {
+        let mut copies = copies();
+        copies.aborted = true;
+        copies.active.drain(..).collect()
+    };
+    for (container, target) in active {
+        if let Err(error) = stop_copy_script(&container, &target) {
+            eprintln!("error: could not stop the copy into {target}: {error:#}");
+        }
+    }
+}
+
+fn stop_copy_script(container: &str, target: &str) -> Result<()> {
+    docker::exec(container, &["sh", "-c", &stop_script(target)]).map(drop)
+}
+
+/// `WITH (FORCE)` (Postgres 13+) ends the sessions and drops atomically, so a
+/// client that reconnects cannot slip in between. Older servers get the two
+/// steps, in one session to keep the gap as small as it can be.
+pub fn pg_drop_statements(version_num: Option<u32>, target: &str) -> Vec<String> {
+    let drop = format!("DROP DATABASE {}", sql_ident(target));
+    if version_num.is_some_and(|version| version >= 130000) {
+        return vec![format!("{drop} WITH (FORCE)")];
+    }
+    vec![
+        format!(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = {}",
+            sql_lit(target)
+        ),
+        drop,
+    ]
 }
 
 /// Drops one copy. The caller has already decided that dropping is allowed.
 pub fn drop_copy(copy: &DatabaseCopy, container: &Container) -> Result<()> {
     check_not_self(&copy.source_db, &copy.target)?;
+    stop_copy_script(container.name(), &copy.target)?;
     match service_kind(copy)? {
         "postgres" => {
             let user = pg_user(container);
-            pg_exec(
-                container,
-                user,
-                "postgres",
-                &format!(
-                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = {}",
-                    sql_lit(&copy.target)
-                ),
-            )?;
-            pg_exec(
-                container,
-                user,
-                "postgres",
-                &format!("DROP DATABASE {}", sql_ident(&copy.target)),
-            )
+            let version = pg_query(container, user, "postgres", "SHOW server_version_num")
+                .ok()
+                .and_then(|out| out.trim().parse().ok());
+            let statements = pg_drop_statements(version, &copy.target);
+            let statements: Vec<&str> = statements.iter().map(String::as_str).collect();
+            pg_session(container, user, "postgres", &statements).map(drop)
         }
         _ => mysql_exec(
             container,
@@ -945,17 +1125,17 @@ pub fn verify(svc: &Service, src: &ContainerSource, target: &str) -> Result<()> 
 }
 
 /// Drops the copies the state records, with the source container in hand.
-/// Returns false when it had to leave the state alone (Docker down, source
-/// stopped or gone), so the caller can keep the registry for later.
+/// Every copy is checked before the first drop, so a refusal leaves them all in
+/// place. Returns false when it had to leave the state alone (source stopped or
+/// gone), so the caller can keep the registry for later.
 pub fn drop_all(
     copies: &[DatabaseCopy],
     env: &Env,
     force: bool,
     protected: &BTreeSet<String>,
 ) -> Result<bool> {
-    if copies.is_empty() {
-        return Ok(true);
-    }
+    let mut droppable = Vec::new();
+    let mut finished = true;
     for copy in copies {
         // A tampered state must never make `down` drop a source database.
         if copy.source_db == copy.target
@@ -971,7 +1151,8 @@ pub fn drop_all(
         // copies with it; keep the registry so a later run can finish.
         let Some(container) = docker::container(&copy.source) else {
             println!("Keeping {}: {} is gone", copy.target, copy.source);
-            return Ok(false);
+            finished = false;
+            continue;
         };
         if !container.state.running {
             if !force {
@@ -982,21 +1163,37 @@ pub fn drop_all(
                 );
             }
             println!("Keeping {}: {} is not running", copy.target, copy.source);
-            return Ok(false);
+            finished = false;
+            continue;
         }
-        match state_of(copy, &container, &env.project, &env.slug)? {
-            MarkerState::Missing => {}
-            MarkerState::Foreign if !force => bail!(
-                "{} is not tagged for {}/{}; pass --force if it is really yours",
-                copy.target,
-                env.project,
-                env.slug
-            ),
-            _ => {
-                drop_copy(copy, &container)?;
-                println!("Dropped database {}", copy.target);
-            }
+        let state = state_of(copy, &container, &env.project, &env.slug)?;
+        if may_drop(state, copy, env, force)? {
+            droppable.push((copy, container));
         }
+    }
+    for (copy, container) in droppable {
+        drop_copy(copy, &container)?;
+        println!("Dropped database {}", copy.target);
+    }
+    Ok(finished)
+}
+
+/// The decision for one copy listed in the state: false when there is nothing
+/// to drop, an error when it is not ours to drop.
+fn may_drop(state: MarkerState, copy: &DatabaseCopy, env: &Env, force: bool) -> Result<bool> {
+    let ours = match state {
+        MarkerState::Missing => return Ok(false),
+        MarkerState::Foreign => false,
+        MarkerState::Unmarked => has_own_name(copy, &env.project, &env.slug),
+        MarkerState::Adopt | MarkerState::Recreate | MarkerState::Reuse => true,
+    };
+    if !ours && !force {
+        bail!(
+            "{} is not tagged for {}/{}; pass --force if it is really yours",
+            copy.target,
+            env.project,
+            env.slug
+        );
     }
     Ok(true)
 }
@@ -1113,11 +1310,11 @@ mod tests {
     fn pg_marker_classification() {
         assert_eq!(
             classify_marker(None, "wte2e", "feat-x"),
-            MarkerState::Foreign
+            MarkerState::Unmarked
         );
         assert_eq!(
             classify_marker(Some("owned by the app"), "wte2e", "feat-x"),
-            MarkerState::Foreign
+            MarkerState::Unmarked
         );
         assert_eq!(
             classify_marker(
@@ -1158,7 +1355,19 @@ mod tests {
         );
         assert_eq!(
             classify_mysql_marker(None, "wte2e", "feat-x"),
+            MarkerState::Unmarked
+        );
+        let mut other = rows.clone();
+        other.insert("wt.slug".into(), "feat-y".into());
+        assert_eq!(
+            classify_mysql_marker(Some(&other), "wte2e", "feat-x"),
             MarkerState::Foreign
+        );
+        let mut partial = rows.clone();
+        partial.remove("wt.complete");
+        assert_eq!(
+            classify_mysql_marker(Some(&partial), "wte2e", "feat-x"),
+            MarkerState::Unmarked
         );
         let mut extra = rows.clone();
         extra.insert("other".into(), "x".into());
@@ -1194,6 +1403,205 @@ mod tests {
                 ("C".to_string(), "pg://h:5432/wt_p_s__cache".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn braces_validation_reads_as_literal_stay_literal() {
+        // Container mode has no targets, and these are not placeholders.
+        let values = vec![
+            ("A".to_string(), "x/{{database}}".to_string()),
+            ("B".to_string(), "x/{database".to_string()),
+            ("C".to_string(), "{{ .Values.x }}:{port}".to_string()),
+        ];
+        assert_eq!(
+            render_env(&values, &[], 5432).unwrap(),
+            vec![
+                ("A".to_string(), "x/{{database}}".to_string()),
+                ("B".to_string(), "x/{database".to_string()),
+                ("C".to_string(), "{{ .Values.x }}:5432".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unknown_database_placeholder_is_an_error() {
+        let targets = vec![("app".to_string(), "t".to_string())];
+        let values = vec![("U".to_string(), "x/{database:other}".to_string())];
+        let err = format!("{:#}", render_env(&values, &targets, 1).unwrap_err());
+        assert!(err.contains("{database:other}"), "{err}");
+        let values = vec![("U".to_string(), "x/{database}".to_string())];
+        assert!(render_env(&values, &[], 1).is_err());
+    }
+
+    fn test_env() -> Env {
+        Env {
+            project: "p".into(),
+            slug: "s".into(),
+            path: "/w/s".into(),
+            legacy_names: false,
+            slug_label: None,
+        }
+    }
+
+    #[test]
+    fn an_unmarked_copy_needs_the_name_wt_would_give_it() {
+        let env = test_env();
+        let own = db("postgres", "app", "wt_p_s__app");
+        assert!(may_drop(MarkerState::Unmarked, &own, &env, false).unwrap());
+        // A state entry edited to point at some other unmarked database.
+        let other = db("postgres", "app", "billing");
+        assert!(may_drop(MarkerState::Unmarked, &other, &env, false).is_err());
+        assert!(may_drop(MarkerState::Unmarked, &other, &env, true).unwrap());
+    }
+
+    #[test]
+    fn a_marker_of_another_owner_always_needs_force() {
+        let env = test_env();
+        let own = db("postgres", "app", "wt_p_s__app");
+        assert!(may_drop(MarkerState::Foreign, &own, &env, false).is_err());
+        assert!(may_drop(MarkerState::Foreign, &own, &env, true).unwrap());
+        assert!(!may_drop(MarkerState::Missing, &own, &env, false).unwrap());
+        assert!(may_drop(MarkerState::Reuse, &own, &env, false).unwrap());
+    }
+
+    #[test]
+    fn registration_is_the_exact_copy() {
+        let copy = db("postgres", "app", "wt_p_s__app");
+        assert!(is_registered(std::slice::from_ref(&copy), &copy));
+        assert!(!is_registered(&[], &copy));
+        let moved = DatabaseCopy {
+            source: "other".into(),
+            ..copy.clone()
+        };
+        assert!(!is_registered(&[moved], &copy));
+    }
+
+    #[test]
+    fn drop_uses_force_where_the_server_has_it() {
+        assert_eq!(
+            pg_drop_statements(Some(160007), "t"),
+            vec!["DROP DATABASE \"t\" WITH (FORCE)".to_string()]
+        );
+        for version in [Some(120000), None] {
+            let statements = pg_drop_statements(version, "t");
+            assert_eq!(statements.len(), 2);
+            assert!(statements[0].contains("pg_terminate_backend"));
+            assert_eq!(statements[1], "DROP DATABASE \"t\"");
+        }
+    }
+
+    #[test]
+    fn mysql_scripts_log_in_as_root() {
+        let script = mysql_copy_script("app", "t", "mysql  Ver 8.0.36");
+        assert!(script.contains("\"$dump\" -uroot"), "{script}");
+        assert!(script.contains("\"$cli\" -uroot"), "{script}");
+        assert!(
+            script.contains("'--ignore-table=app.__wt_meta'"),
+            "{script}"
+        );
+    }
+
+    /// Runs a real copy script with stub tools on PATH.
+    fn run_script(name: &str, stubs: &[(&str, &str)]) -> (std::process::ExitStatus, String) {
+        let dir = std::env::temp_dir().join(format!("wt-test-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (tool, body) in stubs {
+            let path = dir.join(tool);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
+        let target = format!("wt_test_{}_{name}", std::process::id());
+        let script = pg_copy_script("app", &target, "app");
+        let out = std::process::Command::new("sh")
+            .args(["-euc", &script])
+            .env(
+                "PATH",
+                format!("{}:{}", dir.display(), std::env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap();
+        assert!(!std::path::Path::new(&dump_file(&target)).exists());
+        assert!(!std::path::Path::new(&format!("{}.pid", dump_file(&target))).exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+        (
+            out.status,
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    }
+
+    #[test]
+    fn a_failed_dump_fails_the_copy_and_skips_the_restore() {
+        let (status, stdout) = run_script(
+            "dumpfail",
+            &[("pg_dump", "exit 3"), ("psql", "echo restored")],
+        );
+        assert!(!status.success());
+        assert!(!stdout.contains("restored"), "{stdout}");
+    }
+
+    #[test]
+    fn a_failed_restore_fails_the_copy() {
+        let (status, _) = run_script("restfail", &[("pg_dump", "echo d"), ("psql", "exit 4")]);
+        assert!(!status.success());
+    }
+
+    #[test]
+    fn a_good_copy_restores_the_dump() {
+        let (status, stdout) = run_script("good", &[("pg_dump", "echo dumped"), ("psql", "cat")]);
+        assert!(status.success());
+        assert_eq!(stdout.trim(), "dumped");
+    }
+
+    #[test]
+    fn stopping_ends_a_running_copy_and_its_step() {
+        let name = format!("wt_test_{}_stop", std::process::id());
+        let dir = std::env::temp_dir().join(format!("wt-test-{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = dir.join("pg_dump");
+        std::fs::write(&stub, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        let mut perms = std::fs::metadata(&stub).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&stub, perms).unwrap();
+        let mut child = std::process::Command::new("sh")
+            .args(["-euc", &pg_copy_script("app", &name, "app")])
+            .env(
+                "PATH",
+                format!("{}:{}", dir.display(), std::env::var("PATH").unwrap()),
+            )
+            .spawn()
+            .unwrap();
+        let pid_file = format!("{}.pid", dump_file(&name));
+        for _ in 0..100 {
+            if std::path::Path::new(&pid_file).exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let stopped = std::process::Command::new("sh")
+            .args(["-c", &stop_script(&name)])
+            .status()
+            .unwrap();
+        assert!(stopped.success());
+        assert!(!child.wait().unwrap().success());
+        assert!(!std::path::Path::new(&pid_file).exists());
+        assert!(!std::path::Path::new(&dump_file(&name)).exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn stopping_ignores_a_stale_pid_file() {
+        let name = format!("wt_test_{}_stale", std::process::id());
+        let pid_file = format!("{}.pid", dump_file(&name));
+        // Our own pid: alive, but its command line does not name the dump file.
+        std::fs::write(&pid_file, std::process::id().to_string()).unwrap();
+        let stopped = std::process::Command::new("sh")
+            .args(["-c", &stop_script(&name)])
+            .status()
+            .unwrap();
+        assert!(stopped.success());
+        assert!(!std::path::Path::new(&pid_file).exists());
     }
 
     #[test]
@@ -1242,16 +1650,14 @@ mod tests {
         let script = pg_copy_script("app", "wt_p_s__app", "app");
         assert!(!script.contains("| psql"), "{script}");
         assert!(!script.contains("pipefail"), "{script}");
-        assert!(script.matches(DUMP_FILE).count() >= 2, "{script}");
+        assert!(script.contains(&dump_file("wt_p_s__app")), "{script}");
         assert!(script.contains("trap"), "{script}");
-        assert!(script.contains("&&"), "{script}");
 
         let script = mysql_copy_script("app", "wt_p_s__app", "mysql  Ver 8.0.36");
         assert!(!script.contains("| mysql"), "{script}");
         assert!(!script.contains("pipefail"), "{script}");
-        assert!(script.matches(DUMP_FILE).count() >= 2, "{script}");
+        assert!(script.contains(&dump_file("wt_p_s__app")), "{script}");
         assert!(script.contains("trap"), "{script}");
-        assert!(script.contains("&&"), "{script}");
 
         // One dump file per target: two worktrees cannot share a temporary.
         let a_file = dump_file("wt_p_s__a");

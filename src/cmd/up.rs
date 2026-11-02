@@ -65,7 +65,7 @@ pub fn run(branch: &str, base: Option<&str>) -> Result<()> {
                 );
             }
             let port = services::host_port_for(&src)?;
-            let copies = database::plan(svc, &src, &env)?;
+            let copies = database::plan(svc, &src, &env, &previous.databases)?;
             resolved.push(ServiceUp::Database { src, port, copies });
         }
     }
@@ -74,6 +74,9 @@ pub fn run(branch: &str, base: Option<&str>) -> Result<()> {
     let mut next = resolve_ports(&cfg, &env, &previous, &resolved)?;
     let (databases, kept) = planned_databases(&previous, &resolved);
     next.databases = databases;
+    // Rendered once here so a value that cannot be rendered is refused before
+    // the checkout and the state exist.
+    env_values(&cfg, &next, &resolved)?;
 
     git::prune(&main)?;
     create_worktree(&main, &env, branch, base)?;

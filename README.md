@@ -65,7 +65,7 @@ Removes the worktree's containers and volumes, the databases it copied inside th
 Safeguards:
 
 - It removes only resources carrying this worktree's `wt.project` and `wt.slug` labels (or the `docker.slug_label` one, if configured). A container or volume that merely has the expected name is refused, unless you pass `--force`.
-- It removes a copied database only when its marker names this project and slug; a database that merely has the expected name is refused without `--force`. It never drops the source database.
+- It removes a copied database when its marker names this project and slug, or when it has no marker but the state lists it under the exact name `wt` gives that copy (a database reset erases the marker). A marker naming someone else, or a database that merely has the expected name, is refused without `--force`. All copies are checked before the first is dropped, so a refusal drops nothing. It never drops the source database.
 - It never removes a source container or a volume mounted in one.
 - It refuses a checkout with uncommitted changes; `--force` overrides this.
 - It asks for confirmation, then about the branch. Without a terminal, it requires `--yes` (or `WT_YES=1`). Both answer with the default: keep the branch.
@@ -172,9 +172,11 @@ env = {
 - `databases` lists every source database to copy. `database = "x"` is the one-item shorthand; setting both is an error. With neither, `wt` copies the one database the image's own env names (`POSTGRES_DB`/`POSTGRES_USER`, `MYSQL_DATABASE`/`MARIADB_DATABASE`). All of them are copied, so an app with several logical databases needs no extra service.
 - The first entry is the primary: `{database}` is its copy, and `check_sql` runs on it. `{database:<source>}` is the copy of another entry. At least one `env` value in this mode must use `{database}` or `{database:<source>}`, or the worktree would write into the source; `wt` refuses the config otherwise.
 - Each source database becomes `wt_<project>_<slug>__<source>`, sanitized to `[a-z0-9_]` and at most 63 bytes, with a deterministic hash when it would be longer. The name does not depend on the list order, and two names that map to the same target are refused.
-- Ownership is the database itself: a Postgres copy carries `wt.project`, `wt.slug` and `wt.complete` in its database comment; a MySQL copy carries them in a `__wt_meta` table. A database without that marker is refused by `up` and by `down` (unless `--force`), and the source database is never dropped.
+- Ownership is the database itself: a Postgres copy carries `wt.project`, `wt.slug` and `wt.complete` in its database comment; a MySQL copy carries them in a `__wt_meta` table. A marker naming another project or slug is refused by `up` and by `down` (unless `--force`), and so is a database with no marker that the state does not list. The source database is never dropped.
 - The copy is a dump written to a file inside the container and restored from it, so a failed dump cannot be mistaken for a finished copy. Postgres uses `pg_dump`/`psql`; MySQL uses `mysqldump`/`mysql` with `--single-transaction --routines --triggers --events` (`--set-gtid-purged=OFF` only on MySQL, not MariaDB), then grants the app user on the new database.
 - Re-runs reuse a finished copy. A half-copied database (marker `complete=0`) is dropped and copied again, and only that one.
+- App tasks such as `rails db:reset` or Laravel's `migrate:fresh` erase the marker. A copy the state lists under its own name then stays yours: with tables, `up` warns, keeps the data and restores the marker; empty, it is copied again, since there is nothing to lose. A `__wt_meta` table can therefore also reappear after a reset on MySQL.
+- Ctrl-C ends the dump or restore running inside the source and leaves the copy at `complete=0`. If `wt` dies without that chance, the next `up` or `down` ends the leftover script before it drops the copy.
 - `down` drops every copy recorded in the state, including one whose database left `databases` (`up` warns and keeps it). `--keep-checkout` drops the copies and keeps the checkout. If the source container is gone, `down` keeps the state so a later run can drop the copies once the stack is back.
 - Changing a worktree's mode is refused, not migrated: `up` stops with an error and points at `wt down <slug>` when a container or volume of ours (going to database mode) or a registered copy (going back to container mode) is in the way.
 - The source must publish its port on loopback: the worktree connects to it at `127.0.0.1:<published port>`. An ephemeral host port changes when the container is recreated, so publish a fixed one if long-lived worktrees rely on it. A worktree keeps the port it recorded until the next `wt up`, which reads the new published port and rewrites the `.env`.
@@ -197,7 +199,7 @@ The ranges don't overlap each other or the web port. Each sits above its databas
 
 ### The main database during the clone
 
-A byte-for-byte copy needs the database at rest, because a live data directory holds half-written pages. So `wt up` stops the source container (`docker stop`), copies the volume and starts it again. The source is down only for the seconds the copy takes, and comes back even if the copy fails or you press Ctrl-C. This happens only the first time, since re-runs reuse a cloned volume. A half-copied volume (one with neither the `.wt-clone-complete` marker nor the `.worktree-clone-complete` one that `bin/worktree`-style scripts write) is discarded and copied again. If the marker check itself cannot run, `wt up` stops with an error and leaves the volume alone. A service in `mode = "database"` never stops the source: it takes a consistent dump of each database while the stack keeps running.
+A byte-for-byte copy needs the database at rest, because a live data directory holds half-written pages. So `wt up` stops the source container (`docker stop`), copies the volume and starts it again. The source is down only for the seconds the copy takes, and comes back even if the copy fails or you press Ctrl-C. This happens only the first time, since re-runs reuse a cloned volume. A half-copied volume (one with neither the `.wt-clone-complete` marker nor the `.worktree-clone-complete` one that `bin/worktree`-style scripts write) is discarded and copied again, unless a container other than a `wt` copy helper is using it: such a volume may hold real data (a `clone = false` worktree, for example), so `wt up` stops with an error and touches nothing. Ctrl-C stops the copy helper and discards its volume before the source comes back. If the marker check itself cannot run, `wt up` stops with an error and leaves the volume alone. A service in `mode = "database"` never stops the source: it takes a consistent dump of each database while the stack keeps running.
 
 SQLite stops nothing: `sqlite3 .backup` takes a consistent copy even while the app has the file open. Without the `sqlite3` CLI, `wt` copies the file along with its `-wal`/`-shm` files. Each file is copied only once; delete the worktree's copy to copy it again.
 
@@ -299,7 +301,7 @@ after_services = [["pnpm", "prisma", "migrate", "deploy"]]
 | What | Where |
 |---|---|
 | Worktree | `<root>/<slug>` (default `~/.herdr/worktrees/<project>/<slug>`) |
-| Containers | `<project>-wt-<slug>-<type>`, labelled `wt.project`, `wt.slug`, `wt.service` (and `slug_label`, if set) |
+| Containers | `<project>-wt-<slug>-<type>`, labelled `wt.project`, `wt.slug`, `wt.service` (and `slug_label`, if set). Short-lived copy and probe helpers also carry `wt.helper`; `ls` does not count them and `down` removes any left behind |
 | Volumes | `<project>-wt-<slug>-<type>-data`, with the same labels |
 | Copied databases (`mode = "database"`) | `wt_<project>_<slug>__<source>`, inside the source instance, proven by the database comment / `__wt_meta` and recorded in the state |
 | Ports | `~/.local/state/wt/<project>/<slug>.toml` (honours `XDG_STATE_HOME`) |

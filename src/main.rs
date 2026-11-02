@@ -14,6 +14,7 @@ mod sh;
 mod state;
 
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::{Parser, Subcommand};
 
@@ -73,11 +74,19 @@ enum Command {
     },
 }
 
+/// Set as soon as Ctrl-C arrives. Stopping a copy makes the main thread see a
+/// failed command, and it must not exit before the handler has cleaned up.
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    // A source stopped for a copy must come back even on Ctrl-C.
+    // A source stopped for a copy must come back even on Ctrl-C, but only once
+    // no helper is still reading its data directory.
     let _ = ctrlc::set_handler(|| {
+        INTERRUPTED.store(true, Ordering::SeqCst);
+        services::abort_copies();
+        database::abort_copies();
         services::restore_sources();
         std::process::exit(130);
     });
@@ -102,6 +111,11 @@ fn main() -> ExitCode {
         Command::Ls => cmd::ls::run(),
         Command::Init { force } => cmd::init::run(force),
     };
+
+    // The handler ends the process with 130.
+    while INTERRUPTED.load(Ordering::SeqCst) {
+        std::thread::park();
+    }
 
     match result {
         Ok(()) => ExitCode::SUCCESS,

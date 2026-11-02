@@ -12,6 +12,8 @@ use crate::services::Kind;
 pub const LABEL_PROJECT: &str = "wt.project";
 pub const LABEL_SLUG: &str = "wt.slug";
 pub const LABEL_SERVICE: &str = "wt.service";
+/// Marks a throwaway copy or probe container, never a service of the worktree.
+pub const LABEL_HELPER: &str = "wt.helper";
 
 /// One worktree environment: its slug, checkout path and resource names.
 #[derive(Debug, Clone)]
@@ -92,6 +94,12 @@ impl Env {
                 .as_deref()
                 .is_some_and(|key| label(key) == Some(self.slug.as_str()));
         wt || legacy
+    }
+
+    /// A throwaway helper of this environment. Only these may be removed to
+    /// free a half-copied volume: anything else on it may hold real data.
+    pub fn owns_helper<'a>(&self, label: impl Fn(&str) -> Option<&'a str>) -> bool {
+        label(LABEL_HELPER).is_some() && self.owns(label)
     }
 
     /// The service a container of this environment runs: its `wt.service`
