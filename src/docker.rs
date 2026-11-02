@@ -7,6 +7,7 @@ use std::process::Command;
 use anyhow::{Result, bail};
 use serde::Deserialize;
 
+use crate::project::LABEL_HELPER;
 use crate::sh;
 
 fn docker() -> Command {
@@ -358,19 +359,29 @@ pub fn remove_volume(name: &str) -> Result<()> {
     Err(last.unwrap_or_else(|| anyhow::anyhow!("could not remove volume {name}")))
 }
 
-/// Removes every container that mounts `volume`, so a half-copied volume can
-/// be discarded even while a helper is still going away.
-pub fn remove_containers_using_volume(volume: &str) -> Result<()> {
+/// Every container that mounts `volume`, running or not.
+pub fn containers_using_volume(volume: &str) -> Result<Vec<Container>> {
     let ids = lines(&sh::output(docker().args([
         "ps",
         "-aq",
         "--filter",
         &format!("volume={volume}"),
     ]))?);
-    for id in ids {
-        sh::output(docker().args(["rm", "-f", &id])).map(drop)?;
+    Ok(inspect_containers(&ids))
+}
+
+/// Removes a helper and waits until it is no longer running. A helper created
+/// with `--rm` may already be removing itself, which makes `docker rm` fail
+/// while the goal is met, so the check is on the container and not the exit.
+pub fn remove_helper(name: &str) -> bool {
+    let _ = sh::output(docker().args(["rm", "-f", name]));
+    for _ in 0..50 {
+        if !container(name).is_some_and(|c| c.state.running) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    Ok(())
+    false
 }
 
 /// `docker run` with the given arguments; returns stdout.
@@ -386,7 +397,22 @@ pub fn run_shell(
     labels: &[(&str, String)],
     script: &str,
 ) -> Result<String> {
-    let mut args = vec!["--rm".to_string(), "--user".into(), "0:0".into()];
+    run(&shell_args(image, mounts, labels, script))
+}
+
+fn shell_args(
+    image: &str,
+    mounts: &[String],
+    labels: &[(&str, String)],
+    script: &str,
+) -> Vec<String> {
+    let mut args = vec![
+        "--rm".to_string(),
+        "--user".into(),
+        "0:0".into(),
+        "--label".into(),
+        format!("{LABEL_HELPER}=1"),
+    ];
     for (key, value) in labels {
         args.extend(["--label".into(), format!("{key}={value}")]);
     }
@@ -396,7 +422,29 @@ pub fn run_shell(
     }
     args.extend(["--entrypoint".into(), "sh".into(), image.into()]);
     args.extend(["-euc".into(), script.into()]);
-    run(&args)
+    args
+}
+
+/// Creates a named helper without starting it, so an interrupt can always find
+/// it: it either does not exist yet or can be removed by name.
+pub fn create_shell(
+    name: &str,
+    image: &str,
+    mounts: &[String],
+    labels: &[(&str, String)],
+    script: &str,
+) -> Result<()> {
+    sh::output(
+        docker()
+            .args(["create", "--name", name])
+            .args(shell_args(image, mounts, labels, script)),
+    )
+    .map(drop)
+}
+
+/// Starts a created container and waits for it; fails with its exit status.
+pub fn start_attached(name: &str) -> Result<String> {
+    sh::output(docker().args(["start", "-a", name]))
 }
 
 pub fn exec_output(container: &str, argv: &[&str]) -> Option<String> {
@@ -515,6 +563,13 @@ mod tests {
         let c = with_bindings(r#"{"3306/tcp": [{"HostPort": "3306"}]}"#);
         assert_eq!(c.shm_size(), 0);
         assert!(c.ulimits().is_empty());
+    }
+
+    #[test]
+    fn helpers_are_labelled_as_helpers() {
+        let args = shell_args("img", &[], &[("wt.slug", "x".to_string())], "true");
+        assert!(args.windows(2).any(|w| w == ["--label", "wt.helper=1"]));
+        assert!(args.windows(2).any(|w| w == ["--label", "wt.slug=x"]));
     }
 
     #[test]

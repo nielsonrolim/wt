@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -289,6 +289,43 @@ pub fn restore_sources() {
     }
 }
 
+/// Volume copies in flight, for the Ctrl-C handler. A helper does not die with
+/// its client, and one left running would keep copying a source that is live
+/// again and then write the completion marker on a torn copy.
+struct Copies {
+    aborted: bool,
+    active: Vec<(String, String)>,
+}
+
+static COPIES: Mutex<Copies> = Mutex::new(Copies {
+    aborted: false,
+    active: Vec::new(),
+});
+
+fn copies() -> MutexGuard<'static, Copies> {
+    COPIES.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Stops every copy in flight and discards its unfinished volume. Must run
+/// before `restore_sources`: the source may only come back once nothing is
+/// reading its data directory.
+pub fn abort_copies() {
+    let active: Vec<(String, String)> = {
+        let mut copies = copies();
+        copies.aborted = true;
+        copies.active.drain(..).collect()
+    };
+    for (helper, volume) in active {
+        if docker::remove_helper(&helper) {
+            let _ = docker::remove_volume(&volume);
+        } else {
+            eprintln!(
+                "error: could not stop {helper}; run: docker rm -f {helper} && docker volume rm {volume}"
+            );
+        }
+    }
+}
+
 pub struct RestoreOnDrop;
 
 impl Drop for RestoreOnDrop {
@@ -354,9 +391,25 @@ pub fn prepare_volume(svc: &Service, src: &Source, env: &Env) -> Result<()> {
             println!("Reusing {volume}");
             return Ok(());
         }
+        // A Ctrl-C can leave a helper holding the volume. Anything else on it
+        // (a clone seeded with `clone = false`, another tool's container) may
+        // hold real data, so the missing marker does not prove it is a half-copy.
+        let users = docker::containers_using_volume(&volume)?;
+        let (helpers, others): (Vec<&Container>, Vec<&Container>) =
+            users.iter().partition(|c| env.owns_helper(|k| c.label(k)));
+        if let Some(other) = others.first() {
+            bail!(
+                "{volume} has no completion marker but {} is using it, so wt will not discard it; set clone = false to keep it, or run: wt down {}",
+                other.name(),
+                env.slug
+            );
+        }
         println!("Discarding half-copied {volume}");
-        // A Ctrl-C can leave the copy helper holding the volume for a moment.
-        docker::remove_containers_using_volume(&volume)?;
+        for helper in helpers {
+            if !docker::remove_helper(helper.name()) {
+                bail!("could not remove {}, which holds {volume}", helper.name());
+            }
+        }
         docker::remove_volume(&volume)?;
     }
 
@@ -386,15 +439,33 @@ touch /to/{CLONE_MARKER}
 chown "$(stat -c '%u:%g' /from)" /to/{CLONE_MARKER}"#,
         cleanup = svc.kind.cleanup_script()
     );
-    let copied = docker::run_shell(
-        image,
-        &[format!("{}:/from:ro", src.volume), format!("{volume}:/to")],
-        &labels,
-        &script,
-    );
+    let helper = format!("{}-copy", env.container(svc.kind));
+    let mounts = [format!("{}:/from:ro", src.volume), format!("{volume}:/to")];
+    let copied = register_copy(&helper, &volume, image, &mounts, &labels, &script)
+        .and_then(|()| docker::start_attached(&helper));
+    copies().active.retain(|(name, _)| name != &helper);
     restore_sources();
     copied.with_context(|| format!("copying {} into {volume} failed", src.volume))?;
     println!("Cloned {} into {volume}", src.volume);
+    Ok(())
+}
+
+/// Creates the helper under the lock the Ctrl-C handler takes, so the handler
+/// either sees this copy or this copy sees that the run was aborted.
+fn register_copy(
+    helper: &str,
+    volume: &str,
+    image: &str,
+    mounts: &[String],
+    labels: &[(&str, String)],
+    script: &str,
+) -> Result<()> {
+    let mut copies = copies();
+    if copies.aborted {
+        bail!("interrupted");
+    }
+    docker::create_shell(helper, image, mounts, labels, script)?;
+    copies.active.push((helper.to_string(), volume.to_string()));
     Ok(())
 }
 

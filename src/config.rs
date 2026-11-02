@@ -423,13 +423,30 @@ fn check_env(
 /// The contents of every `{...}` in a value, in order.
 fn placeholders(value: &str) -> Vec<String> {
     let mut out = Vec::new();
+    map_placeholders(value, |token| {
+        out.push(token.to_string());
+        None
+    });
+    out
+}
+
+/// Rewrites every `{...}` the callback answers for and leaves the rest as it
+/// was. The one tokenizer for values, so what validation reads as literal text
+/// is exactly what rendering leaves alone. An unterminated `{` is literal.
+pub fn map_placeholders(value: &str, mut replace: impl FnMut(&str) -> Option<String>) -> String {
+    let mut out = String::new();
     let mut rest = value;
     while let Some(start) = rest.find('{') {
         let after = &rest[start + 1..];
         let Some(end) = after.find('}') else { break };
-        out.push(after[..end].to_string());
+        out.push_str(&rest[..start]);
+        match replace(&after[..end]) {
+            Some(text) => out.push_str(&text),
+            None => out.push_str(&rest[start..start + end + 2]),
+        }
         rest = &after[end + 1..];
     }
+    out.push_str(rest);
     out
 }
 

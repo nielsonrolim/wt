@@ -39,7 +39,7 @@ pub fn run() -> Result<()> {
         let env = Env::new(&cfg, slug);
         let containers: Vec<Container> = all_containers
             .iter()
-            .filter(|c| env.owns(|k| c.label(k)))
+            .filter(|c| env.owns(|k| c.label(k)) && !env.owns_helper(|k| c.label(k)))
             .cloned()
             .collect();
         let volumes: Vec<_> = all_volumes

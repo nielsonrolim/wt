@@ -181,26 +181,26 @@ fn assert_safe_name(env: &Env, main: &Path) -> Result<()> {
 /// the only proof `wt up` made a resource; a matching name proves nothing.
 fn find_target(cfg: &Config, env: &Env, force: bool) -> Result<Target> {
     let labels = env.labels();
-    let mut containers: BTreeSet<String> = docker::containers_labelled(&labels)?
-        .iter()
-        .map(|c| c.name().to_string())
-        .collect();
+    let mut labelled = docker::containers_labelled(&labels)?;
     let mut volumes: BTreeSet<String> = docker::volumes_labelled(&labels)?
         .into_iter()
         .map(|v| v.name)
         .collect();
     if let Some(filter) = env.slug_filter() {
-        containers.extend(
-            docker::containers_labelled(&filter)?
-                .iter()
-                .map(|c| c.name().to_string()),
-        );
+        labelled.extend(docker::containers_labelled(&filter)?);
         volumes.extend(
             docker::volumes_labelled(&filter)?
                 .into_iter()
                 .map(|v| v.name),
         );
     }
+    let mut containers: BTreeSet<String> = labelled.iter().map(|c| c.name().to_string()).collect();
+    // A short-lived probe gets a random Docker name; its labels prove it is ours.
+    let helpers: BTreeSet<String> = labelled
+        .iter()
+        .filter(|c| env.owns_helper(|k| c.label(k)))
+        .map(|c| c.name().to_string())
+        .collect();
 
     for kind in Kind::ALL {
         let name = env.container(kind);
@@ -232,7 +232,7 @@ fn find_target(cfg: &Config, env: &Env, force: bool) -> Result<Target> {
     let prefix = env.prefix();
     let (sources, source_volumes) = sources(cfg);
     for name in containers.iter().chain(&volumes) {
-        if !name.starts_with(&prefix) {
+        if !name.starts_with(&prefix) && !helpers.contains(name) {
             bail!("{name} is outside the {prefix} namespace");
         }
         if sources.contains(name) || source_volumes.contains(name) {

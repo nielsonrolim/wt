@@ -40,7 +40,8 @@ cleanup() {
   for id in $(docker ps -aq --filter "label=wt.project=$PROJECT"); do docker rm -f "$id" >/dev/null; done
 docker rm -f "$PROJECT-helper" >/dev/null 2>&1
   for v in $(docker volume ls -q --filter "label=wt.project=$PROJECT"); do docker volume rm -f "$v" >/dev/null; done
-  (cd "$REPO" 2>/dev/null && docker compose down -v >/dev/null 2>&1)
+  (cd "$REPO" 2>/dev/null && docker compose --profile extra down -v >/dev/null 2>&1)
+  docker rmi "$PROJECT-slow:1" >/dev/null 2>&1
   if [ "${KEEP:-}" = 1 ]; then echo "kept $WORK"; else rm -rf "$WORK"; fi
   [ $rc -eq 0 ] && printf '\n\033[32mPASS\033[0m\n' || printf '\n\033[31mFAILED (%s)\033[0m\n' "$rc"
   exit $rc
@@ -106,7 +107,30 @@ services:
     volumes:
       - z-nested-data:/var/lib/postgresql/data
       - ./nested:/var/lib/postgresql/data/pg_wal
+  # Runs as a non-root user, so `docker exec` does too.
+  mariadb-user:
+    profiles: [extra]
+    image: mariadb:11
+    user: "999:999"
+    ports: ["127.0.0.1::3306"]
+    environment:
+      MARIADB_ROOT_PASSWORD: app
+      MARIADB_DATABASE: app
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 1s
+      retries: 60
+    volumes:
+      - mariadb-user-data:/var/lib/mysql
+  # An image whose `cp` is slow, so a copy can be interrupted while it runs.
+  slow:
+    profiles: [extra]
+    image: wte2e-slow:1
+    volumes:
+      - slow-data:/data
 volumes:
+  mariadb-user-data:
+  slow-data:
   pg-data:
   mariadb-data:
   redis-data:
@@ -230,11 +254,13 @@ grep -q '^LOCAL=1$' "$WTP/.env" || fail "hand edit lost"
   fail "a re-run must not touch the source"
 
 step "a half-copied volume held by a helper is discarded"
-# Reproduce the Ctrl-C race without a signal: a container still mounts the
-# volume when the half-copy is discarded.
+# Reproduce the Ctrl-C race without a signal: a helper still mounts the volume
+# when the half-copy is discarded.
 docker run --rm -v "$PROJECT-wt-feat-x-postgres-data:/v" --entrypoint sh \
   postgres:16.7-alpine -euc 'rm -f /v/.wt-clone-complete'
+docker rm -f "$PROJECT-wt-feat-x-postgres" >/dev/null
 docker run -d --name "$PROJECT-helper" -v "$PROJECT-wt-feat-x-postgres-data:/v" \
+  --label wt.helper=1 --label "wt.project=$PROJECT" --label wt.slug=feat-x \
   postgres:16.7-alpine sleep 120 >/dev/null
 "$WT" up feat/x >"$WORK/discard.log" 2>&1
 grep -q 'Discarding half-copied' "$WORK/discard.log" || fail "half-copied volume was not discarded"
@@ -242,6 +268,23 @@ docker inspect "$PROJECT-helper" >/dev/null 2>&1 && fail "the helper holding the
 [ "$(docker run --rm -v "$PROJECT-wt-feat-x-postgres-data:/v" --entrypoint sh \
   postgres:16.7-alpine -euc 'test -f /v/.wt-clone-complete && echo yes')" = yes ] ||
   fail "the recopied volume has no marker"
+
+step "a volume without a marker is not discarded while another container uses it"
+# What `clone = false` seeded has no completion marker either, so turning `clone`
+# on must not take the running clone and its data away.
+docker run --rm -v "$PROJECT-wt-feat-x-postgres-data:/v" --entrypoint sh \
+  postgres:16.7-alpine -euc 'rm -f /v/.wt-clone-complete'
+docker run -d --name "$PROJECT-helper" -v "$PROJECT-wt-feat-x-postgres-data:/v" \
+  postgres:16.7-alpine sleep 120 >/dev/null
+CLONE_STARTED="$(docker inspect -f '{{.State.StartedAt}}' "$PROJECT-wt-feat-x-postgres")"
+if "$WT" up feat/x >"$WORK/in-use.log" 2>&1; then fail "up discarded a volume in use"; fi
+grep -q 'will not discard it' "$WORK/in-use.log" || fail "wrong error for a volume in use"
+[ "$(docker inspect -f '{{.State.StartedAt}}' "$PROJECT-wt-feat-x-postgres")" = "$CLONE_STARTED" ] ||
+  fail "the running clone was touched"
+docker inspect "$PROJECT-helper" >/dev/null 2>&1 || fail "another tool's container was removed"
+docker rm -f "$PROJECT-helper" >/dev/null
+docker run --rm -v "$PROJECT-wt-feat-x-postgres-data:/v" --entrypoint sh \
+  postgres:16.7-alpine -euc 'touch /v/.wt-clone-complete'
 
 step "a branch with the same slug is refused"
 "$WT" up feat-x 2>/dev/null && fail "feat-x reused feat/x's worktree"
@@ -576,7 +619,7 @@ grep -q "database wt_wte2e_db_a__app_cache (source $PROJECT-postgres-1, from app
 [ ! -e "$STATE_DIR/db-a.toml" ] || fail "state left"
 [ ! -e "$DBA" ] || fail "checkout left"
 
-step "database mode: down refuses a copy with no marker and never drops the source"
+step "database mode: down refuses another owner's marker and never drops the source"
 cat >.wt.toml <<EOF
 root = "$WORK/root"
 
@@ -586,7 +629,7 @@ databases = ["app"]
 env = { DATABASE_URL = "postgres://app:app@127.0.0.1:{port}/{database}" }
 EOF
 "$WT" up db/look >/dev/null
-pg "comment on database wt_wte2e_db_look__app is null"
+pg "comment on database wt_wte2e_db_look__app is 'wt.project=wte2e;wt.slug=other;wt.complete=1'"
 "$WT" down db/look --yes 2>"$WORK/look.log" && fail "down dropped an untagged copy"
 grep -q 'not tagged for wte2e/db-look' "$WORK/look.log" || fail "wrong untagged error"
 [ "$(pg "select count(*) from pg_database where datname='wt_wte2e_db_look__app'")" = 1 ] || fail "untagged copy dropped"
@@ -594,6 +637,17 @@ grep -q 'not tagged for wte2e/db-look' "$WORK/look.log" || fail "wrong untagged 
 [ -e "$STATE_DIR/db-look.toml" ] || fail "the refused down removed the state"
 "$WT" down db/look --yes --force >/dev/null
 [ "$(pg "select count(*) from pg_database where datname='wt_wte2e_db_look__app'")" = 0 ] || fail "--force did not drop the untagged copy"
+
+# A stale or edited state does not make any unmarked database ours.
+"$WT" up db/look3 >/dev/null
+pg "create database wte2e_not_ours"
+sed -i 's/^target = .*/target = "wte2e_not_ours"/' "$STATE_DIR/db-look3.toml"
+"$WT" down db/look3 --yes 2>"$WORK/look3.log" && fail "down dropped an unmarked database the state merely names"
+grep -q 'not tagged for wte2e/db-look3' "$WORK/look3.log" || fail "wrong error for an edited state"
+[ "$(pg "select count(*) from pg_database where datname='wte2e_not_ours'")" = 1 ] || fail "the edited state dropped a database"
+pg "drop database wte2e_not_ours"
+sed -i 's/^target = .*/target = "wt_wte2e_db_look3__app"/' "$STATE_DIR/db-look3.toml"
+"$WT" down db/look3 --yes >/dev/null
 
 "$WT" up db/look2 >/dev/null
 sed -i 's/^target = .*/target = "app"/' "$STATE_DIR/db-look2.toml"
@@ -900,6 +954,164 @@ NEW_PORT="$(docker port "$PROJECT-wt-db-legacy2-postgres" 5432/tcp | sed 's/.*:/
 "$WT" ls | awk -v s=db-legacy2 -v p="$NEW_PORT" '$1==s && $4==p {ok=1} END{exit !ok}' || fail "ls after switching back"
 "$WT" down db/legacy2 --yes >/dev/null
 
+step "database mode: a reset database keeps its data and gets its marker back"
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[services.postgres]
+mode = "database"
+databases = ["app"]
+env = { DATABASE_URL = "postgres://app:app@127.0.0.1:{port}/{database}", LITERAL = "{{database}}", OPEN = "{database" }
+
+[services.mysql]
+source = "$PROJECT-mariadb-1"
+mode = "database"
+databases = ["app"]
+env = { MYSQL_URL = "mysql://root:app@127.0.0.1:{port}/{database}" }
+EOF
+"$WT" up db/reset >/dev/null
+PG_RESET=wt_wte2e_db_reset__app
+# Braces validation read as literal text stay literal in the file.
+grep -q '^LITERAL=.*{{database}}' "$WORK/root/db-reset/.env" || fail "a literal value was rewritten"
+grep -q '^OPEN=.*{database' "$WORK/root/db-reset/.env" || fail "an unterminated brace was rewritten"
+# A drop and create followed by a migrate: no comment, the developer's tables.
+pg "select pg_terminate_backend(pid) from pg_stat_activity where datname='$PG_RESET'" >/dev/null
+pg "drop database $PG_RESET"
+pg "create database $PG_RESET"
+pg_of "$PG_RESET" "create table mine(v text); insert into mine values ('dev')"
+# Laravel's migrate:fresh on MySQL: every table goes, then the migrations run.
+my "drop table $PG_RESET.__wt_meta"
+"$WT" up db/reset >"$WORK/reset.log" 2>&1 || fail "up refused a reset copy: $(cat "$WORK/reset.log")"
+[ "$(grep -c 'lost its wt marker' "$WORK/reset.log")" = 2 ] || fail "no warning for the two reset copies"
+[ "$(pg_of "$PG_RESET" 'select v from mine')" = dev ] || fail "the reset postgres copy lost its data"
+[ "$(pg_of "$PG_RESET" "select count(*) from pg_tables where tablename='marker'")" = 0 ] || fail "the reset postgres copy was recopied"
+[ "$(my "select count(*) from $PG_RESET.marker")" = 1 ] || fail "the reset mysql copy lost its data"
+[ "$(pg "select shobj_description(oid,'pg_database') from pg_database where datname='$PG_RESET'")" = "wt.project=wte2e;wt.slug=db-reset;wt.complete=1" ] ||
+  fail "postgres marker not restored"
+[ "$(my "select v from $PG_RESET.__wt_meta where k='wt.complete'")" = 1 ] || fail "mysql marker not restored"
+"$WT" up db/reset >"$WORK/reset2.log" 2>&1
+grep -q 'lost its wt marker' "$WORK/reset2.log" && fail "the marker did not stick"
+
+step "database mode: an empty unmarked copy is copied again"
+# What an interruption right after CREATE DATABASE would leave, on both engines.
+pg "drop database $PG_RESET"
+pg "create database $PG_RESET"
+my "drop database $PG_RESET"
+my "create database $PG_RESET"
+"$WT" up db/reset >"$WORK/empty.log" 2>&1 || fail "up refused an empty copy: $(cat "$WORK/empty.log")"
+[ "$(grep -c "Recreating $PG_RESET" "$WORK/empty.log")" = 2 ] || fail "empty copies not recreated"
+[ "$(pg_of "$PG_RESET" 'select v from marker')" = cloned ] || fail "postgres copy not refilled"
+[ "$(my "select v from $PG_RESET.marker")" = cloned ] || fail "mysql copy not refilled"
+
+step "database mode: a refused down drops nothing, whichever copy refuses"
+# The mysql copy refuses after the postgres one was checked.
+my "update $PG_RESET.__wt_meta set v='other' where k='wt.slug'"
+"$WT" down db/reset --yes 2>"$WORK/atomic.log" && fail "down accepted another owner's marker"
+grep -q 'not tagged for wte2e/db-reset' "$WORK/atomic.log" || fail "wrong refusal"
+[ "$(pg "select count(*) from pg_database where datname='$PG_RESET'")" = 1 ] || fail "the refused down dropped the postgres copy"
+[ -d "$WORK/root/db-reset" ] || fail "the refused down removed the checkout"
+my "update $PG_RESET.__wt_meta set v='db-reset' where k='wt.slug'"
+
+step "database mode: down needs no --force after a reset, and still refuses a dirty checkout"
+pg "comment on database $PG_RESET is null"
+my "drop table $PG_RESET.__wt_meta"
+echo dirty >"$WORK/root/db-reset/untracked-file"
+"$WT" down db/reset --yes 2>"$WORK/reset-dirty.log" && fail "down removed a dirty checkout"
+grep -q 'uncommitted work' "$WORK/reset-dirty.log" || fail "wrong error for a dirty checkout"
+rm "$WORK/root/db-reset/untracked-file"
+
+step "database mode: down wins against a client that keeps reconnecting"
+# The race itself is too narrow to fail reliably, so the server's log proves the
+# drop that closes it was the one that ran.
+pg "alter system set log_statement = 'ddl'" >/dev/null
+pg "select pg_reload_conf()" >/dev/null
+# The clients end by themselves: killing them mid-connect can take the server
+# through crash recovery, which has nothing to do with the drop.
+docker exec "$PROJECT-postgres-1" touch /tmp/wte2e-race
+for _ in $(seq 1 5); do
+  docker exec -d "$PROJECT-postgres-1" sh -c "while [ -e /tmp/wte2e-race ]; do psql -qtAX -U app -d $PG_RESET -c 'select pg_sleep(0)' >/dev/null 2>&1; done"
+done
+sleep 1
+"$WT" down db/reset --yes >"$WORK/race.log" 2>&1 || fail "down lost the race: $(cat "$WORK/race.log")"
+[ "$(pg "select count(*) from pg_database where datname='$PG_RESET'")" = 0 ] || fail "postgres copy left"
+[ "$(my "select count(*) from information_schema.schemata where schema_name='$PG_RESET'")" = 0 ] || fail "mysql copy left"
+docker exec "$PROJECT-postgres-1" rm -f /tmp/wte2e-race
+sleep 1
+docker logs "$PROJECT-postgres-1" >"$WORK/pg-ddl.log" 2>&1
+grep -q 'terminating any other active server processes' "$WORK/pg-ddl.log" && fail "the drop took the source through crash recovery"
+grep -q "DROP DATABASE \"$PG_RESET\" WITH (FORCE)" "$WORK/pg-ddl.log" || fail "the drop did not use WITH (FORCE)"
+pg "alter system reset log_statement" >/dev/null
+pg "select pg_reload_conf()" >/dev/null
+
+step "database mode: Ctrl-C stops the copy running inside the source"
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[services.postgres]
+mode = "database"
+databases = ["app"]
+env = { DATABASE_URL = "postgres://app:app@127.0.0.1:{port}/{database}" }
+EOF
+PG_INT=wt_wte2e_db_int__app
+DUMP_FILE=/tmp/wt-copy-wt_wte2e_db_int_app
+PID_FILE="$DUMP_FILE.pid"
+in_pg() { docker exec "$PROJECT-postgres-1" sh -c "$1"; }
+wait_for_pid_file() {
+  for _ in $(seq 1 100); do
+    in_pg "test -f $PID_FILE" && return 0
+    sleep 0.2
+  done
+  fail "the copy script never started: $(cat "$WORK"/int*.log)"
+}
+in_pg 'mv /usr/local/bin/pg_dump /usr/local/bin/pg_dump.real && printf "#!/bin/sh\nexec sleep 120\n" >/usr/local/bin/pg_dump && chmod +x /usr/local/bin/pg_dump'
+"$WT" up db/int >"$WORK/int.log" 2>&1 &
+WT_PID=$!
+wait_for_pid_file
+RC=0
+kill -INT "$WT_PID"
+wait "$WT_PID" || RC=$?
+[ "$RC" = 130 ] || fail "up exited $RC after Ctrl-C"
+in_pg "test ! -e $PID_FILE" || fail "the copy script survived Ctrl-C"
+in_pg "test ! -e $DUMP_FILE" || fail "the dump file survived Ctrl-C"
+in_pg 'pgrep -f "sleep 120"' >/dev/null && fail "the dump step survived Ctrl-C"
+[ "$(pg "select shobj_description(oid,'pg_database') from pg_database where datname='$PG_INT'")" = "wt.project=wte2e;wt.slug=db-int;wt.complete=0" ] ||
+  fail "an interrupted copy must stay incomplete"
+
+step "database mode: a re-run ends a copy script the last run left behind"
+"$WT" up db/int >"$WORK/int2.log" 2>&1 &
+WT_PID=$!
+wait_for_pid_file
+kill -9 "$WT_PID"
+wait "$WT_PID" || true
+in_pg "test -f $PID_FILE" || fail "the fixture should leave the script running"
+in_pg 'mv /usr/local/bin/pg_dump.real /usr/local/bin/pg_dump'
+"$WT" up db/int >"$WORK/int3.log" 2>&1 || fail "the re-run failed: $(cat "$WORK/int3.log")"
+grep -q "Recreating $PG_INT" "$WORK/int3.log" || fail "the half copy was not recreated"
+in_pg "test ! -e $PID_FILE" || fail "the orphan or its pid file survived"
+in_pg 'pgrep -f "sleep 120"' >/dev/null && fail "the orphan's dump step survived"
+[ "$(pg_of "$PG_INT" 'select v from marker')" = cloned ] || fail "the re-run did not copy the data"
+[ "$(pg "select shobj_description(oid,'pg_database') from pg_database where datname='$PG_INT'")" = "wt.project=wte2e;wt.slug=db-int;wt.complete=1" ] ||
+  fail "the re-run did not finish the copy"
+"$WT" down db/int --yes >/dev/null
+
+step "database mode: mysql works on a source that runs as a non-root user"
+docker compose --profile extra up -d --wait mariadb-user >/dev/null 2>&1
+docker exec "$PROJECT-mariadb-user-1" mariadb -uroot -papp app -e "create table marker(v text); insert into marker values ('nonroot');"
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[services.mysql]
+source = "$PROJECT-mariadb-user-1"
+mode = "database"
+databases = ["app"]
+env = { MYSQL_URL = "mysql://root:app@127.0.0.1:{port}/{database}" }
+EOF
+"$WT" up db/nonroot >"$WORK/nonroot.log" 2>&1 || fail "up failed on a non-root source: $(cat "$WORK/nonroot.log")"
+[ "$(docker exec "$PROJECT-mariadb-user-1" mariadb -uroot -papp -N -B -e "select v from wt_wte2e_db_nonroot__app.marker")" = nonroot ] ||
+  fail "the non-root source was not copied"
+"$WT" down db/nonroot --yes >/dev/null
+docker compose --profile extra rm -sf mariadb-user >/dev/null 2>&1
+
 step "no database copy survived"
 [ -z "$(pg "select datname from pg_database where datname like 'wt_wte2e%'")" ] || fail "postgres copies left"
 [ -z "$(my "select schema_name from information_schema.schemata where schema_name like 'wt_wte2e%'")" ] || fail "mysql copies left"
@@ -921,6 +1133,67 @@ grep -q 'mode = "database"' "$WORK/nested.log" || fail "the refusal does not sug
 [ ! -e "$WORK/root/nested-test" ] || fail "a refused run created a worktree"
 [ ! -e "$XDG_STATE_HOME/wt/$PROJECT/nested-test.toml" ] || fail "a refused run wrote state"
 "$WT" ls | grep -q 'No worktree environments' || fail "nested-test left behind"
+
+step "Ctrl-C during a volume copy stops the helper before the source comes back"
+docker create --name "$PROJECT-slow-base" redis:7-alpine >/dev/null
+printf '#!/bin/sh\nsleep 8\nexec /bin/cp "$@"\n' >"$WORK/slow-cp"
+chmod +x "$WORK/slow-cp"
+docker cp "$WORK/slow-cp" "$PROJECT-slow-base:/usr/local/bin/cp" >/dev/null
+docker commit "$PROJECT-slow-base" "$PROJECT-slow:1" >/dev/null
+docker rm -f "$PROJECT-slow-base" >/dev/null
+docker compose --profile extra up -d slow >/dev/null 2>&1
+SLOW="$PROJECT-slow-1"
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[services.redis]
+source = "$SLOW"
+env = { REDIS_URL = "redis://127.0.0.1:{port}" }
+EOF
+wait_for_helper() {
+  for _ in $(seq 1 150); do
+    [ "$(docker inspect -f '{{.State.Running}}' "$PROJECT-wt-$1-redis-copy" 2>/dev/null)" = true ] && return 0
+    sleep 0.2
+  done
+  fail "the copy helper of $1 never started"
+}
+"$WT" up slow/a >"$WORK/slow-a.log" 2>&1 &
+WT_PID=$!
+wait_for_helper slow-a
+[ "$(docker inspect -f '{{.State.Running}}' "$SLOW")" = false ] || fail "the source should be stopped for the copy"
+RC=0
+kill -INT "$WT_PID"
+wait "$WT_PID" || RC=$?
+[ "$RC" = 130 ] || fail "up exited $RC after Ctrl-C: $(cat "$WORK/slow-a.log")"
+docker inspect "$PROJECT-wt-slow-a-redis-copy" >/dev/null 2>&1 && fail "the helper survived Ctrl-C"
+[ "$(docker inspect -f '{{.State.Running}}' "$SLOW")" = true ] || fail "the source did not come back"
+docker volume inspect "$PROJECT-wt-slow-a-redis-data" >/dev/null 2>&1 && fail "the unfinished volume survived Ctrl-C"
+"$WT" down slow/a --yes >/dev/null
+
+step "a helper left running does not stop ls or down"
+"$WT" up slow/b >"$WORK/slow-b.log" 2>&1 &
+WT_PID=$!
+wait_for_helper slow-b
+kill -9 "$WT_PID"
+wait "$WT_PID" || true
+docker inspect "$PROJECT-wt-slow-b-redis-copy" >/dev/null || fail "the fixture should leave the helper running"
+"$WT" ls >"$WORK/slow-ls.log"
+awk -v s=slow-b '$1==s {for(i=1;i<=NF;i++) if($i=="running"||$i=="partial") bad=1} END{exit bad}' "$WORK/slow-ls.log" ||
+  fail "ls counted the helper as a service: $(cat "$WORK/slow-ls.log")"
+# The same with the random name of a short-lived probe.
+docker run -d --label wt.helper=1 --label "wt.project=$PROJECT" --label wt.slug=slow-b \
+  --name "probe-$PROJECT" redis:7-alpine sleep 120 >/dev/null
+"$WT" down slow/b --yes >"$WORK/slow-down.log" 2>&1 || fail "down refused a helper: $(cat "$WORK/slow-down.log")"
+docker inspect "$PROJECT-wt-slow-b-redis-copy" >/dev/null 2>&1 && fail "down left the helper"
+docker inspect "probe-$PROJECT" >/dev/null 2>&1 && fail "down left the probe"
+docker volume inspect "$PROJECT-wt-slow-b-redis-data" >/dev/null 2>&1 && fail "down left the volume"
+docker start "$SLOW" >/dev/null
+
+step "an interrupted copy is copied again from scratch"
+"$WT" up slow/c >"$WORK/slow-c.log" 2>&1 || fail "up after the interruptions failed: $(cat "$WORK/slow-c.log")"
+[ "$(docker inspect -f '{{.State.Running}}' "$SLOW")" = true ] || fail "the source did not come back after a good copy"
+"$WT" down slow/c --yes >/dev/null
+docker compose --profile extra rm -sf slow >/dev/null 2>&1
 
 step "legacy names and the slug label"
 cat >.wt.toml <<EOF
