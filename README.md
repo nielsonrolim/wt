@@ -236,7 +236,7 @@ Hooks get these variables in their environment: `WT_SLUG`, `WT_BRANCH`, `WT_PATH
 
 ## Examples
 
-**Rails with Postgres** ([`examples/rails-postgres.wt.toml`](examples/rails-postgres.wt.toml)): Postgres in compose and Active Storage on disk.
+**Rails with Postgres, `mode = "container"` (the default)** ([`examples/rails-postgres.wt.toml`](examples/rails-postgres.wt.toml)): each worktree gets its own Postgres container, cloned from the compose one. Postgres in compose and Active Storage on disk.
 
 ```toml
 [app]
@@ -249,7 +249,7 @@ setup = [["bundle", "install"], ["bun", "install"]]
 after_services = [["bin/rails", "db:prepare"]]
 ```
 
-**Rails with Postgres, sharing the main instance** ([`examples/rails-postgres-database.wt.toml`](examples/rails-postgres-database.wt.toml)): no container per worktree; each worktree gets its own logical databases inside the compose Postgres.
+**Rails with Postgres, `mode = "database"`** ([`examples/rails-postgres-database.wt.toml`](examples/rails-postgres-database.wt.toml)): no container per worktree; each worktree gets its own logical databases inside the compose Postgres.
 
 ```toml
 [app]

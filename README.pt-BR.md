@@ -228,7 +228,7 @@ Os hooks recebem no ambiente: `WT_SLUG`, `WT_BRANCH`, `WT_PATH`, `WT_MAIN_ROOT`,
 
 ## Exemplos
 
-**Rails com Postgres** ([`examples/rails-postgres.wt.toml`](examples/rails-postgres.wt.toml)): Postgres no compose e Active Storage em disco.
+**Rails com Postgres, `mode = "container"` (o padrão)** ([`examples/rails-postgres.wt.toml`](examples/rails-postgres.wt.toml)): cada worktree ganha o próprio container Postgres, clonado do container do compose. Postgres no compose e Active Storage em disco.
 
 ```toml
 [app]
@@ -241,7 +241,7 @@ setup = [["bundle", "install"], ["bun", "install"]]
 after_services = [["bin/rails", "db:prepare"]]
 ```
 
-**Rails com Postgres, compartilhando a instância principal** ([`examples/rails-postgres-database.wt.toml`](examples/rails-postgres-database.wt.toml)): sem container por worktree; cada uma ganha bancos lógicos próprios dentro do Postgres do compose.
+**Rails com Postgres, `mode = "database"`** ([`examples/rails-postgres-database.wt.toml`](examples/rails-postgres-database.wt.toml)): sem container por worktree; cada uma ganha bancos lógicos próprios dentro do Postgres do compose.
 
 ```toml
 [app]
