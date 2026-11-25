@@ -30,7 +30,7 @@ A CLI that gives each git worktree its own development databases and web port. A
 ## Adding a container adapter
 
 1. Add a `Kind` variant in `src/services.rs` and a match arm in each `Kind` method plus `probe`. The `ranges_do_not_overlap` test enforces port ranges that are disjoint from the others and from 3001–3099.
-2. Add the field to `Services` and the entry to the list in `config::resolve`.
+2. Add the field to `Services` and the entry to the list in `config::resolve_app` (which resolves every app's services, so "at most one of each" holds per app).
 3. Add a column to the adapter table in both READMEs.
 
 A new adapter supports `mode = "container"` only. To accept `mode = "database"`, also add the marker, create/copy/drop and existence branches in `src/database.rs`, allow it in `config.rs`, and document it in the adapter table; `state.databases` resolves the service through `Kind::from_name`.

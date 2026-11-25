@@ -83,13 +83,7 @@ pub fn run(slug_arg: Option<&str>, opts: Options) -> Result<()> {
 
     // Drop the copies before the containers, so a refusal leaves everything
     // intact instead of removing the clones first.
-    let mut protected = BTreeSet::new();
-    for svc in &cfg.services {
-        protected.extend(svc.databases.iter().cloned());
-        if let Some(database) = &svc.database {
-            protected.insert(database.clone());
-        }
-    }
+    let protected = protected_databases(&cfg);
     // `dropped` is false when the copies could not be dropped (Docker down, or
     // the source stopped or gone): the state file stays behind so a later run
     // can finish the job.
@@ -256,12 +250,27 @@ fn not_labelled(env: &Env) -> String {
     text
 }
 
-/// The main stack's containers and every volume they mount.
+/// Every app's source databases: `down --force` never drops one, whichever
+/// app names it.
+fn protected_databases(cfg: &Config) -> BTreeSet<String> {
+    let mut protected = BTreeSet::new();
+    for svc in cfg.services() {
+        protected.extend(svc.databases.iter().cloned());
+        protected.extend(svc.database.clone());
+    }
+    protected
+}
+
+/// Every app's source container names.
+fn source_names(cfg: &Config) -> BTreeSet<String> {
+    cfg.services().map(|svc| svc.source.clone()).collect()
+}
+
+/// Every app's source containers and every volume they mount.
 fn sources(cfg: &Config) -> (BTreeSet<String>, BTreeSet<String>) {
-    let mut containers = BTreeSet::new();
+    let containers = source_names(cfg);
     let mut volumes = BTreeSet::new();
-    for svc in &cfg.services {
-        containers.insert(svc.source.clone());
+    for svc in cfg.services() {
         volumes.extend(svc.volume.clone());
         if let Some(c) = docker::container(&svc.source) {
             volumes.extend(c.volume_mounts().filter_map(|m| m.name.clone()));
@@ -403,4 +412,44 @@ fn remove_checkout(main: &Path, env: &Env, force: bool) -> Result<()> {
     git::prune(main)?;
     println!("Removed {}", env.path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn two_apps() -> Config {
+        Config::from_toml(
+            r#"
+            [services.postgres]
+            database = "main_db"
+            [apps.b]
+            dir = "b"
+            [apps.b.services.postgres]
+            source = "b-pg-1"
+            mode = "database"
+            databases = ["b_one", "b_two"]
+            env = { U = "x/{database}" }
+            "#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn every_apps_source_databases_are_protected() {
+        let protected = protected_databases(&two_apps());
+        assert_eq!(
+            protected.into_iter().collect::<Vec<_>>(),
+            ["b_one", "b_two", "main_db"]
+        );
+    }
+
+    #[test]
+    fn every_apps_source_container_is_a_source() {
+        let names = source_names(&two_apps());
+        assert_eq!(
+            names.into_iter().collect::<Vec<_>>(),
+            ["b-pg-1", "myapp-postgres-1"]
+        );
+    }
 }

@@ -220,11 +220,11 @@ mod tests {
         let cfg = config::Config::load(&dir).unwrap();
         fs::remove_dir_all(&dir).unwrap();
 
-        assert_eq!(cfg.services.len(), 2);
+        assert_eq!(cfg.default.services.len(), 2);
         assert_eq!(cfg.service(Kind::Redis).unwrap().source, "cache-1");
-        assert_eq!(cfg.app.copy, vec!["storage"]);
-        assert_eq!(cfg.hooks.setup.len(), 2);
-        assert_eq!(cfg.sqlite.unwrap().files.len(), 1);
+        assert_eq!(cfg.default.app.copy, vec!["storage"]);
+        assert_eq!(cfg.default.hooks.setup.len(), 2);
+        assert_eq!(cfg.default.sqlite.unwrap().files.len(), 1);
         // The generated file stays on the default (container) mode.
         assert!(!text.contains("mode ="), "{text}");
     }

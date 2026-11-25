@@ -1,0 +1,29 @@
+# A monorepo with two apps in one worktree: the top-level sections are the
+# default app (apps/platform), and [apps.coa-api] adds another, with its own
+# compose project. See "Several apps in one repo" in the README.
+
+# The default app: apps/platform.
+[app]
+env_file = "apps/platform/.env"
+
+[services.postgres]
+database = "platform_development"
+
+[hooks]
+dir = "apps/platform"
+setup = [["bundle", "install"], { run = ["bun", "install"], dir = "." }]
+
+# Another app, with its own compose project.
+[apps.coa-api]
+dir = "apps/coa-api"            # required: the app's folder in the worktree
+
+[apps.coa-api.app]
+port_env = "COA_API_PORT"
+port_range = [8001, 8099]
+
+[apps.coa-api.services.postgres]
+source = "coa-api-postgres-1"
+database = "coa_references"
+
+[apps.coa-api.hooks]
+setup = [["uv", "sync"]]
