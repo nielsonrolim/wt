@@ -46,7 +46,7 @@ struct File {
     #[serde(default)]
     services: Services,
     #[serde(default)]
-    hooks: Hooks,
+    hooks: RawHooks,
     #[serde(default)]
     docker: Docker,
 }
@@ -121,13 +121,66 @@ pub struct Sqlite {
     pub files: Vec<String>,
 }
 
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
+struct RawHooks {
+    dir: Option<String>,
+    #[serde(default)]
+    setup: Vec<RawHook>,
+    #[serde(default)]
+    after_services: Vec<RawHook>,
+}
+
+/// A hook is an argv, or `{ run = argv, dir = "…" }` to run it somewhere other
+/// than `hooks.dir`.
+#[derive(Debug)]
+enum RawHook {
+    Argv(Vec<String>),
+    Table(HookTable),
+}
+
+// By hand rather than `untagged`, so an error inside the table form (an
+// unknown key, no `run`) reaches the user instead of a generic mismatch.
+impl<'de> Deserialize<'de> for RawHook {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> de::Visitor<'de> for Visitor {
+            type Value = RawHook;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an argv list or { run = [...], dir = \"...\" }")
+            }
+            fn visit_seq<A: de::SeqAccess<'de>>(self, seq: A) -> Result<RawHook, A::Error> {
+                Vec::deserialize(de::value::SeqAccessDeserializer::new(seq)).map(RawHook::Argv)
+            }
+            fn visit_map<A: de::MapAccess<'de>>(self, map: A) -> Result<RawHook, A::Error> {
+                HookTable::deserialize(de::value::MapAccessDeserializer::new(map))
+                    .map(RawHook::Table)
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HookTable {
+    run: Vec<String>,
+    dir: Option<String>,
+}
+
+#[derive(Debug, Default, Clone)]
 pub struct Hooks {
-    #[serde(default)]
-    pub setup: Vec<Vec<String>>,
-    #[serde(default)]
-    pub after_services: Vec<Vec<String>>,
+    pub setup: Vec<Hook>,
+    pub after_services: Vec<Hook>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hook {
+    pub argv: Vec<String>,
+    /// Relative to the worktree root and normalized: no `.` or `..`
+    /// components; the root is a lone `.`. `hooks::run` also refuses a symlink
+    /// out of it.
+    pub dir: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -232,14 +285,7 @@ fn resolve(file: File, main_root: &Path, path: Option<PathBuf>) -> Result<Config
     if file.docker.slug_label.as_deref() == Some("") {
         bail!("docker.slug_label must not be empty");
     }
-    for (phase, hooks) in [
-        ("setup", &file.hooks.setup),
-        ("after_services", &file.hooks.after_services),
-    ] {
-        if let Some(i) = hooks.iter().position(|argv| argv.is_empty()) {
-            bail!("hooks.{phase}[{i}] is an empty command");
-        }
-    }
+    let hooks = resolve_hooks(file.hooks)?;
 
     let mut services = Vec::new();
     for (kind, entry) in [
@@ -348,9 +394,72 @@ fn resolve(file: File, main_root: &Path, path: Option<PathBuf>) -> Result<Config
         app: file.app,
         services,
         sqlite: file.services.sqlite,
-        hooks: file.hooks,
+        hooks,
         docker: file.docker,
     })
+}
+
+/// Gives every hook its own dir: its `dir`, else `hooks.dir`, else the root.
+fn resolve_hooks(raw: RawHooks) -> Result<Hooks> {
+    let default = match &raw.dir {
+        Some(dir) => inside_worktree("hooks.dir", dir)?,
+        None => PathBuf::from("."),
+    };
+    let phase = |name: &str, hooks: Vec<RawHook>| -> Result<Vec<Hook>> {
+        hooks
+            .into_iter()
+            .enumerate()
+            .map(|(i, hook)| {
+                let (argv, dir) = match hook {
+                    RawHook::Argv(argv) => (argv, default.clone()),
+                    RawHook::Table(t) => {
+                        let dir = match &t.dir {
+                            Some(d) => inside_worktree(&format!("hooks.{name}[{i}].dir"), d)?,
+                            None => default.clone(),
+                        };
+                        (t.run, dir)
+                    }
+                };
+                if argv.is_empty() {
+                    bail!("hooks.{name}[{i}] is an empty command");
+                }
+                Ok(Hook { argv, dir })
+            })
+            .collect()
+    };
+    Ok(Hooks {
+        setup: phase("setup", raw.setup)?,
+        after_services: phase("after_services", raw.after_services)?,
+    })
+}
+
+/// A relative path whose `..` never climbs above the worktree root, returned
+/// normalized. The check is lexical: `..` is resolved here, before symlinks,
+/// so the OS never sees it; `hooks::run` then resolves symlinks.
+fn inside_worktree(key: &str, dir: &str) -> Result<PathBuf> {
+    use std::path::Component;
+    if dir.is_empty() {
+        bail!("{key} must not be empty; use \".\" for the worktree root");
+    }
+    let mut path = PathBuf::new();
+    for part in Path::new(dir).components() {
+        match part {
+            Component::Normal(name) => path.push(name),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !path.pop() {
+                    bail!("{key} = {dir:?} must stay inside the worktree");
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                bail!("{key} = {dir:?} must be relative to the worktree root")
+            }
+        }
+    }
+    if path.as_os_str().is_empty() {
+        path.push(".");
+    }
+    Ok(path)
 }
 
 fn check_range(name: &str, (first, last): (u16, u16)) -> Result<()> {
@@ -748,7 +857,8 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(cfg.hooks.setup[1], vec!["bun", "install"]);
+        assert_eq!(cfg.hooks.setup[1].argv, vec!["bun", "install"]);
+        assert_eq!(cfg.hooks.setup[1].dir, PathBuf::from("."));
         assert_eq!(cfg.hooks.after_services.len(), 1);
     }
 
@@ -756,6 +866,101 @@ mod tests {
     fn rejects_empty_or_string_hooks() {
         assert!(load("[hooks]\nsetup = [[]]").is_err());
         assert!(load("[hooks]\nsetup = [\"bun install\"]").is_err());
+        let err = |text: &str| format!("{:#}", load(text).unwrap_err());
+        let e = err("[hooks]\nsetup = [{ run = [] }]");
+        assert!(e.contains("hooks.setup[0] is an empty command"), "{e}");
+        let e = err("[hooks]\nsetup = [{ dir = \"a\" }]");
+        assert!(e.contains("missing field `run`"), "{e}");
+        let e = err("[hooks]\nsetup = [{ run = [\"x\"], cwd = \"a\" }]");
+        assert!(e.contains("unknown field `cwd`"), "{e}");
+        let e = err("[hooks]\nsetup = [\"bun install\"]");
+        assert!(e.contains("{ run = [...], dir = \"...\" }"), "{e}");
+    }
+
+    #[test]
+    fn hooks_dir_applies_to_every_hook_unless_overridden() {
+        let cfg = load(
+            r#"
+            [hooks]
+            dir = "apps/platform"
+            setup = [["bundle", "install"], { run = ["bun", "install"], dir = "." }]
+            after_services = [["bin/rails", "db:migrate"]]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.hooks.setup[0].argv, vec!["bundle", "install"]);
+        assert_eq!(cfg.hooks.setup[0].dir, PathBuf::from("apps/platform"));
+        assert_eq!(cfg.hooks.setup[1].argv, vec!["bun", "install"]);
+        assert_eq!(cfg.hooks.setup[1].dir, PathBuf::from("."));
+        assert_eq!(
+            cfg.hooks.after_services[0].dir,
+            PathBuf::from("apps/platform")
+        );
+        let cfg = load("[hooks]\ndir = \"apps/platform\"\nsetup = [{ run = [\"x\"] }]").unwrap();
+        assert_eq!(cfg.hooks.setup[0].dir, PathBuf::from("apps/platform"));
+    }
+
+    #[test]
+    fn hooks_load_as_an_array_of_tables() {
+        let cfg = load(
+            "[hooks]\ndir = \"apps/web\"\n[[hooks.setup]]\nrun = [\"bun\", \"install\"]\ndir = \".\"\n[[hooks.setup]]\nrun = [\"bundle\"]",
+        )
+        .unwrap();
+        assert_eq!(cfg.hooks.setup[0].argv, vec!["bun", "install"]);
+        assert_eq!(cfg.hooks.setup[0].dir, PathBuf::from("."));
+        assert_eq!(cfg.hooks.setup[1].dir, PathBuf::from("apps/web"));
+    }
+
+    #[test]
+    fn hooks_dir_is_stored_normalized() {
+        for (raw, want) in [
+            ("a/./b", "a/b"),
+            ("./a/", "a"),
+            ("a/..", "."),
+            ("a/../b", "b"),
+            (".", "."),
+        ] {
+            let cfg = load(&format!("[hooks]\ndir = {raw:?}\nsetup = [[\"x\"]]")).unwrap();
+            assert_eq!(cfg.hooks.setup[0].dir, PathBuf::from(want), "{raw}");
+        }
+    }
+
+    #[test]
+    fn hook_dir_alone_overrides_the_root() {
+        let cfg = load("[hooks]\nsetup = [{ run = [\"bundle\"], dir = \"apps/web\" }]").unwrap();
+        assert_eq!(cfg.hooks.setup[0].dir, PathBuf::from("apps/web"));
+    }
+
+    #[test]
+    fn hooks_dir_stays_inside_the_worktree() {
+        for (bad, why) in [
+            ("/abs", "must be relative"),
+            ("..", "must stay inside"),
+            ("../x", "must stay inside"),
+            ("a/../../x", "must stay inside"),
+            ("", "must not be empty"),
+        ] {
+            let err = format!(
+                "{:#}",
+                load(&format!("[hooks]\ndir = {bad:?}")).unwrap_err()
+            );
+            assert!(
+                err.contains("hooks.dir") && err.contains(why),
+                "{bad}: {err}"
+            );
+            let err = format!(
+                "{:#}",
+                load(&format!(
+                    "[hooks]\nafter_services = [{{ run = [\"x\"], dir = {bad:?} }}]"
+                ))
+                .unwrap_err()
+            );
+            assert!(
+                err.contains("hooks.after_services[0].dir") && err.contains(why),
+                "{bad}: {err}"
+            );
+        }
+        assert!(load("[hooks]\ndir = \"a/./b\"").is_ok());
     }
 
     #[test]
@@ -783,7 +988,10 @@ mod tests {
             "myapp-postgres-1"
         );
         assert_eq!(cfg.app.copy, vec!["storage"]);
-        assert_eq!(cfg.hooks.after_services[0], vec!["bin/rails", "db:prepare"]);
+        assert_eq!(
+            cfg.hooks.after_services[0].argv,
+            vec!["bin/rails", "db:prepare"]
+        );
     }
 
     #[test]

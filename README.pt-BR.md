@@ -54,7 +54,7 @@ Passos, nesta ordem:
 2. Escolhe as portas: a porta web e uma por serviço, cada uma na sua faixa, pulando as que algum container (mesmo parado) publica, as que outra worktree de qualquer projeto já recebeu e as que têm algo escutando. Um serviço em `mode = "database"` não tem porta própria: usa a porta publicada da origem. Toda origem é resolvida antes, então origem ausente, porta não publicada (ou fora do loopback), banco estranho ou nome de banco de origem errado abortam antes do checkout e do estado.
 3. Escreve o `.env` da worktree (copiado do principal na primeira vez) e o `.envrc`.
 4. Copia os arquivos SQLite e os caminhos de `app.copy`, e atualiza os de `app.refresh`.
-5. Roda `hooks.setup`.
+5. Roda `hooks.setup` e depois confere o `dir` do primeiro hook de `after_services`.
 6. Para cada serviço: clona o volume e sobe o container ou, com `mode = "database"`, copia os bancos lógicos dentro da instância de origem. Depois espera ficar pronto e confere que os dados vieram.
 7. Roda `hooks.after_services`.
 
@@ -137,6 +137,7 @@ legacy_names = false        # true: o clone do Postgres é <project>-wt-<slug> e
 # slug_label = "myapp.worktree.slug"   # label extra com o slug; não definida por padrão
 
 [hooks]
+# dir = "apps/web"          # onde os hooks rodam, relativo à worktree; padrão: a raiz dela
 setup = []                  # antes dos serviços
 after_services = []         # depois que os serviços estão prontos
 ```
@@ -214,7 +215,7 @@ Para um repo que já tem ambientes de worktree feitos por outra ferramenta: o `w
 
 ### Hooks
 
-Cada hook é uma lista de argumentos, executada direto, sem shell, no diretório da worktree. Eles rodam em ordem, e o primeiro que falhar interrompe o `wt up`.
+Cada hook é uma lista de argumentos (ou uma tabela, abaixo), executada direto, sem shell, na raiz da worktree, ou em `hooks.dir` ou no `dir` do próprio hook (abaixo). Eles rodam em ordem, e o primeiro que falhar interrompe o `wt up`.
 
 ```toml
 [hooks]
@@ -223,6 +224,24 @@ after_services = [["bin/rails", "db:prepare"]]
 ```
 
 Sem shell, não há pipes, `||`, globs nem `$VAR`. Para isso, aponte para um script do repo (`["bin/setup"]`) ou chame o shell explicitamente (`["sh", "-c", "…"]`).
+
+Num monorepo, `dir` faz os hooks rodarem numa subpasta da worktree em vez da raiz. Um hook pode sobrescrevê-lo com a forma de tabela `{ run = [...], dir = "..." }`:
+
+```toml
+[hooks]
+dir = "apps/platform"
+setup = [
+  ["bundle", "install"],
+  { run = ["bun", "install"], dir = "." },   # o workspace do bun fica na raiz
+]
+after_services = [["bin/rails", "db:migrate"]]
+```
+
+`dir` é opcional na forma de tabela: `{ run = [...] }` sozinho roda em `hooks.dir` (a raiz, se não estiver definido). Tabelas `[[hooks.setup]]` também funcionam. `dir` precisa ser relativo e ficar dentro da worktree, symlinks incluídos. Ele é usado ao pé da letra: `~` e `$VAR` não são expandidos, e `..` é resolvido como texto antes de qualquer symlink, então `apps/current/../shared` é `apps/shared` mesmo quando `apps/current` é um symlink.
+
+Um `dir` vazio, absoluto ou que escapa com `..` é recusado quando o `.wt.toml` é carregado, antes de o `wt up` criar qualquer coisa. Se o `dir` existe é conferido logo antes do próprio hook rodar, então um hook anterior pode criá-lo; antes do primeiro hook, o `wt up` avisa sobre qualquer `dir` seguinte que ainda não existe. O `dir` do primeiro hook de `after_services` é conferido assim que o `setup` termina, antes de os serviços subirem, já que nada pode criá-lo depois disso. Um `dir` que não existe, não é um diretório ou aponta para fora da worktree interrompe o `wt up` nesse ponto, depois que a worktree já existe. O erro mostra o arquivo de config que o `wt` leu; corrija-o (ou o checkout) e rode `wt up` de novo. Os hooks rodam com `PWD` apontando para o seu `dir` com os symlinks resolvidos, e `WT_PATH` é sempre a raiz da worktree.
+
+Gerenciadores de versão que usam shims (asdf, shims do mise) leem o `.tool-versions` ou o `mise.toml` do `dir` do hook e dos diretórios acima, então já escolhem as versões certas. Um que é ativado pelo shell (`mise activate`, direnv) não: o hook herda o `PATH` e as outras variáveis montadas para o diretório onde você digitou `wt up`. Envolva o comando para ele resolver no `dir` do hook, por exemplo `["mise", "exec", "--", "bundle", "install"]` ou `["direnv", "exec", ".", "bundle", "install"]`. O `mise exec` confia na config que carrega, e a confiança dada no checkout principal vale também para as worktrees dele (a menos que o modo paranoid do mise esteja ligado). O direnv autoriza cada caminho separadamente, então o `.envrc` de uma worktree nova fica bloqueado até um hook como `["direnv", "allow", "."]` rodar antes.
 
 Os hooks recebem no ambiente: `WT_SLUG`, `WT_BRANCH`, `WT_PATH`, `WT_MAIN_ROOT`, `WT_APP_PORT` e `WT_POSTGRES_PORT`/`WT_MYSQL_PORT`/`WT_REDIS_PORT` (só dos serviços configurados). Em `mode = "database"`, recebem também `WT_POSTGRES_DATABASE`/`WT_MYSQL_DATABASE` (o nome da cópia primária) e `WT_POSTGRES_DATABASES`/`WT_MYSQL_DATABASES` (`origem=alvo,origem=alvo`).
 

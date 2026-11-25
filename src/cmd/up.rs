@@ -4,7 +4,7 @@ use std::path::Path;
 
 use anyhow::{Result, bail};
 
-use crate::config::{Config, Mode};
+use crate::config::{self, Config, Mode};
 use crate::database::{self, MarkerState};
 use crate::docker::{Container, Volume};
 use crate::project::{self, Env};
@@ -91,7 +91,25 @@ pub fn run(branch: &str, base: Option<&str>) -> Result<()> {
     files::refresh_paths(&main, &env.path, &cfg.app.refresh)?;
 
     let hook_env = hook_env(&main, &cfg, &env, branch, &next, &resolved);
-    hooks::run("setup", &cfg.hooks.setup, &env.path, &hook_env)?;
+    let config_file = cfg
+        .path
+        .clone()
+        .unwrap_or_else(|| main.join(config::FILE_NAME));
+    for note in hooks::early_notes(&cfg.hooks.setup, &cfg.hooks.after_services, &env.path) {
+        eprintln!("warning: {note}");
+    }
+    hooks::run(
+        "setup",
+        &cfg.hooks.setup,
+        &env.path,
+        &hook_env,
+        &config_file,
+    )?;
+    // Once setup is done nothing can create after_services[0]'s dir, so a
+    // missing one fails here rather than after the sources are copied.
+    if let Some(first) = cfg.hooks.after_services.first() {
+        hooks::dir("after_services", 0, first, &env.path, &config_file)?;
+    }
 
     {
         // Restarts any source still stopped if a step below fails.
@@ -121,6 +139,7 @@ pub fn run(branch: &str, base: Option<&str>) -> Result<()> {
         &cfg.hooks.after_services,
         &env.path,
         &hook_env,
+        &config_file,
     )?;
     report(&cfg, &env, branch, &next, &resolved);
     Ok(())

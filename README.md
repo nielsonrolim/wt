@@ -54,7 +54,7 @@ Steps, in order:
 2. Picks the ports: the web port and one per service, each from its own range. It skips ports published by any container (stopped ones included), ports already given to another worktree of any project, and ports something is listening on. A service in `mode = "database"` has no port of its own: it uses the source's published port. Every source is resolved first, so a missing source, an unpublished (or non-loopback) port, a foreign database or a source-database typo aborts before the checkout and the state are created.
 3. Writes the worktree's `.env`, copied from the main checkout the first time, and `.envrc`.
 4. Copies the SQLite files and the `app.copy` paths, and refreshes the `app.refresh` paths.
-5. Runs `hooks.setup`.
+5. Runs `hooks.setup`, then checks the first `after_services` hook's `dir`.
 6. For each service, clones the volume and starts the container, or, with `mode = "database"`, copies the logical databases inside the source instance. It then waits until the service is ready and checks that the data came across.
 7. Runs `hooks.after_services`.
 
@@ -145,6 +145,7 @@ legacy_names = false        # true: the Postgres clone is <project>-wt-<slug>, i
 # slug_label = "myapp.worktree.slug"   # an extra label holding the slug; unset by default
 
 [hooks]
+# dir = "apps/web"          # where hooks run, relative to the worktree; default: its root
 setup = []                  # before the services
 after_services = []         # once the services are ready
 ```
@@ -222,7 +223,7 @@ For a repo that already has worktree environments made by another tool, so `wt` 
 
 ### Hooks
 
-Each hook is a list of arguments, run directly in the worktree directory without a shell. Hooks run in order, and the first one to fail stops `wt up`.
+Each hook is a list of arguments (or a table, below), run directly without a shell in the worktree root, or in `hooks.dir` or the hook's own `dir` (below). Hooks run in order, and the first one to fail stops `wt up`.
 
 ```toml
 [hooks]
@@ -231,6 +232,24 @@ after_services = [["bin/rails", "db:prepare"]]
 ```
 
 Without a shell there are no pipes, `||`, globs or `$VAR`. For those, point at a script in the repo (`["bin/setup"]`) or call the shell explicitly (`["sh", "-c", "…"]`).
+
+In a monorepo, `dir` runs the hooks in a subfolder of the worktree instead of its root. A single hook can override it with the table form `{ run = [...], dir = "..." }`:
+
+```toml
+[hooks]
+dir = "apps/platform"
+setup = [
+  ["bundle", "install"],
+  { run = ["bun", "install"], dir = "." },   # the bun workspace lives at the root
+]
+after_services = [["bin/rails", "db:migrate"]]
+```
+
+`dir` is optional in the table form: `{ run = [...] }` alone runs in `hooks.dir` (the root when unset). `[[hooks.setup]]` tables work too. `dir` must be relative and stay inside the worktree, symlinks included. It is taken literally: `~` and `$VAR` are not expanded, and `..` is resolved as text before any symlink, so `apps/current/../shared` is `apps/shared` even when `apps/current` is a symlink.
+
+An empty, absolute or escaping `dir` is refused when `.wt.toml` loads, before `wt up` creates anything. Whether the `dir` exists is checked right before its own hook runs, so an earlier hook may create it; before the first hook, `wt up` warns about any later `dir` that does not exist yet. The first `after_services` hook's `dir` is checked as soon as `setup` ends, before the services start, since nothing can create it after that. A `dir` that is missing, is not a directory or resolves outside the worktree stops `wt up` at that point, after the worktree exists. The error names the config file `wt` read; fix it (or the checkout) and run `wt up` again. Hooks run with `PWD` set to their `dir` with symlinks resolved, and `WT_PATH` is always the worktree root.
+
+Version managers that use shims (asdf, mise shims) read `.tool-versions` or `mise.toml` from the hook's `dir` and its parents, so they already pick the right versions. One that activates through your shell (`mise activate`, direnv) does not: the hook inherits the `PATH` and other variables set up for the directory where you typed `wt up`. Wrap the command so it resolves in the hook's `dir`, for example `["mise", "exec", "--", "bundle", "install"]` or `["direnv", "exec", ".", "bundle", "install"]`. `mise exec` trusts the config it loads, and trust given in the main checkout carries over to its worktrees (unless mise's paranoid mode is on). direnv allows each path separately, so a new worktree's `.envrc` is blocked until a hook such as `["direnv", "allow", "."]` runs first.
 
 Hooks get these variables in their environment: `WT_SLUG`, `WT_BRANCH`, `WT_PATH`, `WT_MAIN_ROOT`, `WT_APP_PORT`, and `WT_POSTGRES_PORT`/`WT_MYSQL_PORT`/`WT_REDIS_PORT` for the configured services only. In `mode = "database"`, they also get `WT_POSTGRES_DATABASE`/`WT_MYSQL_DATABASE` (the primary copy's name) and `WT_POSTGRES_DATABASES`/`WT_MYSQL_DATABASES` (`source=target,source=target`).
 

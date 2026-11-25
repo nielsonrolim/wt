@@ -8,7 +8,8 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 PROJECT=wte2e
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/wt-e2e.XXXXXX")"
+# Resolved, so paths wt reports (canonical) match on macOS, where /var is /private/var.
+WORK="$(cd "$(mktemp -d "${TMPDIR:-/tmp}/wt-e2e.XXXXXX")" && pwd -P)"
 REPO="$WORK/$PROJECT"
 WT="$HERE/target/debug/wt"
 
@@ -137,8 +138,9 @@ volumes:
   pg-noport-data:
   z-nested-data:
 EOF
-printf '/.env*\n/.envrc\n/hook-*.out\n/storage/*\n!/storage/.keep\n/agents/\n' >.gitignore
+printf '/.env*\n/.envrc\nhook-*.out\n/storage/*\n!/storage/.keep\n/agents/\n' >.gitignore
 touch storage/.keep
+mkdir -p apps/web && touch apps/web/.keep
 printf 'SECRET=main\nDB_PORT=5432\n' >.env
 echo '{}' >package.json
 git add -A && git commit --quiet -m init
@@ -193,8 +195,15 @@ env = { MYSQL_HOST = "127.0.0.1", MYSQL_PORT = "{port}" }
 files = ["storage/development.sqlite3"]
 
 [hooks]
-setup = [["sh", "-c", "echo setup \$WT_SLUG > hook-setup.out"]]
-after_services = [["sh", "-c", "echo \$WT_POSTGRES_PORT \$WT_MYSQL_PORT \$WT_REDIS_PORT \$WT_APP_PORT > hook-after.out"]]
+dir = "apps/web"
+setup = [
+  { run = ["sh", "-c", "echo setup \$WT_SLUG > hook-setup.out"], dir = "." },
+  { run = ["mkdir", "-p", "gen"], dir = "." },
+]
+after_services = [
+  ["sh", "-c", "echo \$WT_POSTGRES_PORT \$WT_MYSQL_PORT \$WT_REDIS_PORT \$WT_APP_PORT \$WT_PATH > hook-after.out"],
+  { run = ["touch", "hook-gen.out"], dir = "gen" },
+]
 EOF
 
 step "wt up feat/x"
@@ -226,8 +235,11 @@ mysql_port="$(docker port "$PROJECT-wt-feat-x-mysql" 3306/tcp)"
 [ "$(sqlite3 "$WTP/storage/development.sqlite3" 'select v from marker')" = cloned ] || fail "sqlite not copied"
 [ "$(cat "$WTP/storage/ab/blob")" = blob ] || fail "storage not copied"
 [ "$(cat "$WTP/hook-setup.out")" = "setup feat-x" ] || fail "setup hook"
-read -r hp hm hr ha <"$WTP/hook-after.out"
+[ -f "$WTP/hook-after.out" ] && fail "after_services hook ignored hooks.dir"
+read -r hp hm hr ha hpath <"$WTP/apps/web/hook-after.out"
 [ "$hp" = "$PG_PORT" ] && [ "$hm" = "$MYSQL_PORT" ] && [ "$ha" = "$APP_PORT" ] && [ -n "$hr" ] || fail "after_services hook env"
+[ "$hpath" = "$WTP" ] || fail "WT_PATH is $hpath, not the worktree root $WTP"
+[ -f "$WTP/gen/hook-gen.out" ] || fail "an after_services hook could not use a dir a setup hook created"
 [ "$(docker inspect -f '{{.State.Running}}' "$PROJECT-postgres-1")" = true ] || fail "source not restarted"
 [ "$PG_STARTED" != "$(docker inspect -f '{{.State.StartedAt}}' "$PROJECT-postgres-1")" ] ||
   fail "a byte copy must stop and restart the source"
@@ -252,6 +264,21 @@ grep -q '^LOCAL=1$' "$WTP/.env" || fail "hand edit lost"
 [ "$(grep -c 'Written by wt up' "$WTP/.env")" = 1 ] || fail "banner stacked"
 [ "$RERUN_STARTED" = "$(docker inspect -f '{{.State.StartedAt}}' "$PROJECT-postgres-1")" ] ||
   fail "a re-run must not touch the source"
+
+step "a missing after_services dir stops up after setup, before the services, and a fixed config resumes"
+sed -i.bak 's|^dir = "apps/web"$|dir = "apps/nope"|' .wt.toml && rm -f .wt.toml.bak
+rm -f "$WTP/hook-setup.out"
+"$WT" up feat/x >"$WORK/baddir.log" 2>&1 && fail "up accepted a missing hooks.dir"
+grep -q 'hooks.after_services\[0\] runs in .*apps/nope, which does not exist in the checkout' "$WORK/baddir.log" || fail "bad dir error: $(cat "$WORK/baddir.log")"
+grep -q 'hooks.after_services\[0\] runs in apps/nope, which does not exist yet' "$WORK/baddir.log" || fail "no early warning for a missing dir"
+grep -q "fix $REPO/.wt.toml or the checkout and run wt up again" "$WORK/baddir.log" || fail "bad dir error has no hint naming the config"
+grep -q "Reusing $PROJECT-wt-feat-x" "$WORK/baddir.log" && fail "services ran although after_services[0] could never run"
+[ -f "$WTP/hook-setup.out" ] || fail "setup did not run before the after_services dir check"
+[ "$(docker inspect -f '{{.State.Running}}' "$PROJECT-postgres-1")" = true ] || fail "source left stopped"
+sed -i.bak 's|^dir = "apps/nope"$|dir = "apps/web"|' .wt.toml && rm -f .wt.toml.bak
+rm -f "$WTP/apps/web/hook-after.out"
+"$WT" up feat/x >/dev/null
+[ -f "$WTP/apps/web/hook-after.out" ] || fail "fixed hooks.dir did not resume"
 
 step "a half-copied volume held by a helper is discarded"
 # Reproduce the Ctrl-C race without a signal: a helper still mounts the volume
