@@ -5,13 +5,16 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 
-use crate::config::Config;
+use crate::config::{AppId, Config};
 use crate::git;
 use crate::services::Kind;
 
 pub const LABEL_PROJECT: &str = "wt.project";
 pub const LABEL_SLUG: &str = "wt.slug";
 pub const LABEL_SERVICE: &str = "wt.service";
+/// The `[apps.<name>]` a resource belongs to. The default app's resources have
+/// none, as they did before apps existed.
+pub const LABEL_APP: &str = "wt.app";
 /// Marks a throwaway copy or probe container, never a service of the worktree.
 pub const LABEL_HELPER: &str = "wt.helper";
 
@@ -21,10 +24,13 @@ pub struct Env {
     pub project: String,
     pub slug: String,
     pub path: PathBuf,
-    /// `docker.legacy_names`: the Postgres clone drops the service from its name.
+    /// `docker.legacy_names`: the Postgres clone drops the service from its
+    /// name (the default app's only).
     pub legacy_names: bool,
     /// `docker.slug_label`: an extra label that carries the slug.
     pub slug_label: Option<String>,
+    /// The app these names are for; every app of a worktree shares its path.
+    pub app: AppId,
 }
 
 impl Env {
@@ -35,6 +41,16 @@ impl Env {
             path: canon(&cfg.root).join(slug),
             legacy_names: cfg.docker.legacy_names,
             slug_label: cfg.docker.slug_label.clone(),
+            app: AppId::Default,
+        }
+    }
+
+    /// The same worktree, seen as one of its apps. It takes an `AppId`, not
+    /// the app's config, so `down` can reach an app the config dropped.
+    pub fn with_app(self, app: &AppId) -> Env {
+        Env {
+            app: app.clone(),
+            ..self
         }
     }
 
@@ -42,7 +58,12 @@ impl Env {
         format!("{}-wt-", self.project)
     }
 
+    /// An extra app's names put the app after a `.`. No project, slug or app
+    /// name contains a `.`, so an extra's names never match a default app's.
     pub fn container(&self, kind: Kind) -> String {
+        if let Some(app) = self.app.label() {
+            return format!("{}{}.{app}-{}", self.prefix(), self.slug, kind.name());
+        }
         if self.legacy_names && kind == Kind::Postgres {
             return format!("{}{}", self.prefix(), self.slug);
         }
@@ -50,7 +71,7 @@ impl Env {
     }
 
     pub fn volume(&self, kind: Kind) -> String {
-        if self.legacy_names && kind == Kind::Postgres {
+        if self.legacy_names && kind == Kind::Postgres && self.app == AppId::Default {
             return format!("{}-db", self.container(kind));
         }
         format!("{}-data", self.container(kind))
@@ -76,6 +97,9 @@ impl Env {
     pub fn creation_labels(&self, kind: Kind) -> Vec<(&str, String)> {
         let mut labels = self.labels().to_vec();
         labels.push((LABEL_SERVICE, kind.name().to_string()));
+        if let Some(app) = self.app.label() {
+            labels.push((LABEL_APP, app.to_string()));
+        }
         labels.extend(self.slug_filter().into_iter().flatten());
         labels
     }
@@ -102,14 +126,24 @@ impl Env {
         label(LABEL_HELPER).is_some() && self.owns(label)
     }
 
+    /// Whether a resource of this worktree belongs to this app: its `wt.app`
+    /// names it, or it has none and this is the default app.
+    pub fn is_its_app<'a>(&self, label: impl Fn(&str) -> Option<&'a str>) -> bool {
+        label(LABEL_APP) == self.app.label()
+    }
+
     /// The service a container of this environment runs: its `wt.service`
     /// label, or the one whose name it carries when a tool without that label
-    /// created it.
+    /// created it, which in practice is the default app's unlabelled clone.
     pub fn service_of<'a>(
         &self,
         name: &str,
         label: impl Fn(&str) -> Option<&'a str>,
     ) -> Option<Kind> {
+        // Another app's resource, or the default app's when this is an extra.
+        if !self.is_its_app(&label) {
+            return None;
+        }
         label(LABEL_SERVICE)
             .and_then(Kind::from_name)
             .or_else(|| Kind::ALL.into_iter().find(|k| self.container(*k) == name))
@@ -183,6 +217,7 @@ mod tests {
             path: PathBuf::from("/w/feat-x"),
             legacy_names: false,
             slug_label: None,
+            app: AppId::Default,
         };
         assert_eq!(env.container(Kind::Postgres), "myapp-wt-feat-x-postgres");
         assert_eq!(env.volume(Kind::Redis), "myapp-wt-feat-x-redis-data");
@@ -196,6 +231,7 @@ mod tests {
             path: PathBuf::from("/w/feat-x"),
             legacy_names: true,
             slug_label: Some("platform.worktree.slug".into()),
+            app: AppId::Default,
         }
     }
 
@@ -253,5 +289,152 @@ mod tests {
             Some(Kind::Postgres)
         );
         assert_eq!(env.service_of("platform-wt-feat-y", |_| None), None);
+    }
+
+    // ---- Several apps ----
+
+    use crate::config::AppName;
+
+    fn monorepo() -> Config {
+        Config::from_toml(include_str!("../examples/monorepo.wt.toml")).unwrap()
+    }
+
+    fn app_env(legacy: bool) -> Env {
+        let mut env = legacy_env();
+        env.legacy_names = legacy;
+        env.with_app(&AppId::Extra(AppName::parse("coa-api").unwrap()))
+    }
+
+    #[test]
+    fn an_extra_apps_names_carry_the_app_after_a_dot() {
+        let env = app_env(false);
+        assert_eq!(
+            env.container(Kind::Postgres),
+            "platform-wt-feat-x.coa-api-postgres"
+        );
+        assert_eq!(
+            env.volume(Kind::Postgres),
+            "platform-wt-feat-x.coa-api-postgres-data"
+        );
+        // legacy_names only ever renames the default app's Postgres.
+        assert_eq!(
+            app_env(true).container(Kind::Postgres),
+            env.container(Kind::Postgres)
+        );
+        assert_eq!(
+            app_env(true).volume(Kind::Postgres),
+            env.volume(Kind::Postgres)
+        );
+    }
+
+    #[test]
+    fn an_extra_never_shares_a_name_with_another_worktree() {
+        // slug feat + app coa-api vs the default app of slug feat-coa-api.
+        let mut extra = app_env(false);
+        extra.slug = "feat".into();
+        let mut default = legacy_env();
+        default.legacy_names = false;
+        default.slug = "feat-coa-api".into();
+        for kind in Kind::ALL {
+            assert_ne!(extra.container(kind), default.container(kind));
+            assert_ne!(extra.volume(kind), default.volume(kind));
+        }
+    }
+
+    #[test]
+    fn two_apps_of_the_monorepo_get_their_own_clone() {
+        let cfg = monorepo();
+        let default = Env::new(&cfg, "feat-x");
+        let api = Env::new(&cfg, "feat-x").with_app(&cfg.extras[0].id);
+        assert_ne!(
+            default.container(Kind::Postgres),
+            api.container(Kind::Postgres)
+        );
+        assert_eq!(
+            default.container(Kind::Postgres),
+            "myapp-wt-feat-x-postgres"
+        );
+        assert_eq!(
+            api.container(Kind::Postgres),
+            "myapp-wt-feat-x.coa-api-postgres"
+        );
+        assert_eq!(api.path, default.path);
+        assert_eq!(api.app.label(), Some("coa-api"));
+        assert_eq!(default.app.label(), None);
+    }
+
+    #[test]
+    fn an_extras_resources_carry_wt_app() {
+        let api = app_env(false);
+        let labels = api.creation_labels(Kind::Postgres);
+        assert!(labels.contains(&(LABEL_APP, "coa-api".to_string())));
+        assert!(labels.contains(&(LABEL_SLUG, "feat-x".to_string())));
+        let default = legacy_env();
+        let labels = default.creation_labels(Kind::Postgres);
+        assert!(!labels.iter().any(|(k, _)| *k == LABEL_APP));
+    }
+
+    #[test]
+    fn ownership_is_per_worktree_whatever_the_app() {
+        let wt_app = |k: &str| match k {
+            LABEL_PROJECT => Some("platform"),
+            LABEL_SLUG => Some("feat-x"),
+            LABEL_APP => Some("coa-api"),
+            _ => None,
+        };
+        assert!(legacy_env().owns(wt_app));
+        assert!(app_env(false).owns(wt_app));
+    }
+
+    #[test]
+    fn service_of_tells_two_apps_apart() {
+        let default = legacy_env();
+        let api = app_env(false);
+        let api_pg = |k: &str| match k {
+            LABEL_SERVICE => Some("postgres"),
+            LABEL_APP => Some("coa-api"),
+            _ => None,
+        };
+        let default_pg = |k: &str| (k == LABEL_SERVICE).then_some("postgres");
+        let other_app = |k: &str| match k {
+            LABEL_SERVICE => Some("postgres"),
+            LABEL_APP => Some("other"),
+            _ => None,
+        };
+        let name = api.container(Kind::Postgres);
+        assert_eq!(api.service_of(&name, api_pg), Some(Kind::Postgres));
+        assert_eq!(default.service_of(&name, api_pg), None);
+        assert_eq!(default.service_of("x", default_pg), Some(Kind::Postgres));
+        assert_eq!(api.service_of("x", default_pg), None);
+        assert_eq!(api.service_of("x", other_app), None);
+        // The name fallback still finds the default app's legacy clone.
+        assert_eq!(
+            default.service_of("platform-wt-feat-x", |_| None),
+            Some(Kind::Postgres)
+        );
+        assert_eq!(api.service_of("platform-wt-feat-x", |_| None), None);
+    }
+
+    #[test]
+    fn an_extra_keeps_the_worktrees_slug_label() {
+        let labels_of = |env: &Env| {
+            env.creation_labels(Kind::Redis)
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect::<Vec<_>>()
+        };
+        let labels = labels_of(&app_env(false));
+        assert!(labels.contains(&("platform.worktree.slug".to_string(), "feat-x".to_string())));
+    }
+
+    #[test]
+    fn a_resource_belongs_to_one_app() {
+        let api = app_env(false);
+        let default = legacy_env();
+        let api_label = |k: &str| (k == LABEL_APP).then_some("coa-api");
+        assert!(api.is_its_app(api_label));
+        assert!(!default.is_its_app(api_label));
+        assert!(default.is_its_app(|_| None));
+        assert!(!api.is_its_app(|_| None));
     }
 }

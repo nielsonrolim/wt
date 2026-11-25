@@ -292,9 +292,9 @@ setup = [["uv", "sync"]]
 - `dir` define os padrões do app: `env_file` é `<dir>/.env`, os hooks rodam em `<dir>` e o `.envrc` dele vai em `<dir>`. Caminhos que você escreve (`env_file`, `copy`, `refresh`, `sqlite.files`, `hooks.dir`) continuam relativos à raiz da worktree.
 - As tabelas de um app aceitam as mesmas chaves das do topo, menos `project`, `root`, `[docker]` e `[apps]`, que descrevem a worktree inteira. Cada serviço Postgres, MySQL e Redis dele precisa definir `source`: o padrão do compose (`<project>-<tipo>-1`) é o container do app padrão.
 - O nome de um app usa letras minúsculas e dígitos, com hífens simples entre eles, no máximo 30 caracteres; `default` é reservado.
-- O `.wt.toml` é recusado quando dois apps escreveriam o mesmo arquivo de env, `.envrc` ou arquivo SQLite; quando o `copy` ou o `refresh` de um app se sobrepõe ao de outro, ou cobre o arquivo de env, o `.envrc` ou os arquivos SQLite de outro app; quando dois apps usam a mesma origem em modos diferentes; e quando dois apps copiam da mesma origem em `mode = "database"` sem nomear os bancos (`database` ou `databases`), ou nomeiam bancos cujas cópias teriam o mesmo nome.
+- O `.wt.toml` é recusado quando dois apps escreveriam o mesmo arquivo de env, `.envrc` ou arquivo SQLite; quando o `copy` ou o `refresh` de um app se sobrepõe ao de outro, ou cobre o arquivo de env, o `.envrc` ou os arquivos SQLite de outro app; quando dois apps usam a mesma origem em modos diferentes; e quando dois apps copiam da mesma origem em `mode = "database"` sem nomear os bancos (`database` ou `databases`), ou os dois nomeiam o mesmo banco (uma worktree tem uma cópia de cada banco de origem; no MySQL, nomes que diferem só em maiúsculas e minúsculas contam como o mesmo).
 
-Subir esses apps ainda não foi implementado: hoje `wt up`, `wt ls` e `wt down` só agem sobre o app padrão (o `wt up` avisa), e as tabelas `[apps.*]` são apenas conferidas. Elas são conferidas pelo `wt up`, `wt ls` e `wt down`, então uma tabela `[apps.*]` inválida trava `wt up`, `wt ls` e `wt down` do mesmo jeito. O wt 0.4 e anteriores recusam `[apps.*]` por completo.
+Subir esses apps ainda não foi implementado: hoje `wt up`, `wt ls` e `wt down` só agem sobre o app padrão (o `wt up` avisa; o `wt down` remove a worktree inteira, então remove também todo container e volume com a label do slug dela e toda cópia de banco que o arquivo de estado lista, seja de qual app for), e as tabelas `[apps.*]` são apenas conferidas. Elas são conferidas pelo `wt up`, `wt ls` e `wt down`, então uma tabela `[apps.*]` inválida trava `wt up`, `wt ls` e `wt down` do mesmo jeito. O wt 0.4 e anteriores recusam `[apps.*]` por completo.
 
 ## Exemplos
 
@@ -370,7 +370,7 @@ after_services = [["pnpm", "prisma", "migrate", "deploy"]]
 
 Com `docker.legacy_names`, o Postgres é `<project>-wt-<slug>` e o volume dele `<project>-wt-<slug>-db`.
 
-As portas ficam fora do checkout para não aparecerem no `git status`. Esse arquivo é o que um re-run reaproveita e o que impede duas worktrees, criadas com os servidores parados, de receberem a mesma porta web.
+As portas ficam fora do checkout para não aparecerem no `git status`. Esse arquivo é o que um re-run reaproveita e o que impede duas worktrees, criadas com os servidores parados, de receberem a mesma porta web. O mesmo arquivo lista as cópias de banco da worktree, então o `wt up` e o `wt down` se recusam a rodar enquanto ele não puder ser lido, em vez de reescrevê-lo ou apagá-lo: corrija ou remova o arquivo. O `wt ls` avisa e segue.
 
 ## Integrações
 

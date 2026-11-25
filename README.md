@@ -300,9 +300,9 @@ setup = [["uv", "sync"]]
 - `dir` supplies the app's defaults: `env_file` is `<dir>/.env`, hooks run in `<dir>`, and its `.envrc` goes in `<dir>`. Paths you write yourself (`env_file`, `copy`, `refresh`, `sqlite.files`, `hooks.dir`) stay relative to the worktree root.
 - An app's tables take the same keys as the top-level ones, except `project`, `root`, `[docker]` and `[apps]`, which describe the whole worktree. Each of its Postgres, MySQL and Redis services must set `source`: the compose default (`<project>-<type>-1`) is the default app's container.
 - An app name is lowercase letters and digits, with single dashes between them, at most 30 characters; `default` is reserved.
-- `.wt.toml` is refused when two apps would write the same env file, `.envrc` or SQLite file; when one app's `copy` or `refresh` overlaps another's, or covers another app's env file, `.envrc` or SQLite files; when two apps use one source in different modes; and when two apps copy from one source in `mode = "database"` without naming their databases (`database` or `databases`), or name databases whose copies would get the same name.
+- `.wt.toml` is refused when two apps would write the same env file, `.envrc` or SQLite file; when one app's `copy` or `refresh` overlaps another's, or covers another app's env file, `.envrc` or SQLite files; when two apps use one source in different modes; and when two apps copy from one source in `mode = "database"` without naming their databases (`database` or `databases`), or both name the same database (a worktree gets one copy of each source database; on MySQL, names that differ only in case count as the same).
 
-Bringing these apps up is not implemented yet: today `wt up`, `wt ls` and `wt down` only act on the default app (`wt up` says so), and the `[apps.*]` tables are only checked. They are checked by `wt up`, `wt ls` and `wt down`, so an invalid `[apps.*]` table stops `wt up`, `wt ls` and `wt down` alike. wt 0.4 and older refuse `[apps.*]` altogether.
+Bringing these apps up is not implemented yet: today `wt up`, `wt ls` and `wt down` only act on the default app (`wt up` says so; `wt down` removes the whole worktree, so it also removes every container and volume labelled with its slug and every database copy its state file lists, whatever their app), and the `[apps.*]` tables are only checked. They are checked by `wt up`, `wt ls` and `wt down`, so an invalid `[apps.*]` table stops `wt up`, `wt ls` and `wt down` alike. wt 0.4 and older refuse `[apps.*]` altogether.
 
 ## Examples
 
@@ -378,7 +378,7 @@ after_services = [["pnpm", "prisma", "migrate", "deploy"]]
 
 With `docker.legacy_names`, Postgres is `<project>-wt-<slug>` and its volume `<project>-wt-<slug>-db`.
 
-Ports live outside the checkout so they never show up in `git status`. A re-run reuses the ports in that file. Because the file records every port handed out, two worktrees created while their servers are stopped never get the same web port.
+Ports live outside the checkout so they never show up in `git status`. A re-run reuses the ports in that file. Because the file records every port handed out, two worktrees created while their servers are stopped never get the same web port. The same file lists the worktree's database copies, so `wt up` and `wt down` refuse to run while it cannot be read, rather than rewrite or delete it: fix or remove it. `wt ls` warns and goes on.
 
 ## Integrations
 
