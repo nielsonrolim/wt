@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::process::Command;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::project::LABEL_HELPER;
@@ -227,6 +227,31 @@ fn inspect_containers(ids: &[String]) -> Vec<Container> {
 
 pub fn container(name: &str) -> Option<Container> {
     inspect_containers(&[name.to_string()]).into_iter().next()
+}
+
+/// The container `name` names, none when Docker says there is no such
+/// container, and an error for anything else: a check that must not be
+/// skipped cannot read a daemon failure as "gone".
+pub fn find_container(name: &str) -> Result<Option<Container>> {
+    let out = docker()
+        .args(["inspect", "--type", "container", name])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .with_context(|| format!("could not run docker inspect {name}"))?;
+    inspected(out.status.success(), &out.stdout, &out.stderr)
+        .with_context(|| format!("docker inspect {name}"))
+}
+
+fn inspected(success: bool, stdout: &[u8], stderr: &[u8]) -> Result<Option<Container>> {
+    if !success {
+        let err = String::from_utf8_lossy(stderr);
+        if err.contains("No such") {
+            return Ok(None);
+        }
+        bail!("{}", err.trim());
+    }
+    let found: Vec<Container> = serde_json::from_slice(stdout).context("unreadable output")?;
+    Ok(found.into_iter().next())
 }
 
 fn filters(labels: &[(&str, String)]) -> Vec<String> {
@@ -625,5 +650,17 @@ mod tests {
             r#"{"53/udp": [{"HostPort": "53"}], "3307/tcp": [{"HostPort": "3307"}]}"#,
         );
         assert_eq!(c.container_port(3306), Some(3307));
+    }
+
+    #[test]
+    fn only_a_missing_container_is_none() {
+        assert!(inspected(true, b"[]", b"").unwrap().is_none());
+        assert!(
+            inspected(false, b"[]", b"Error: No such container: x")
+                .unwrap()
+                .is_none()
+        );
+        assert!(inspected(false, b"", b"Cannot connect to the Docker daemon").is_err());
+        assert!(inspected(true, b"not json", b"").is_err());
     }
 }

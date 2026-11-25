@@ -37,6 +37,12 @@ enum Command {
         /// Where a new branch starts from (default: HEAD)
         #[arg(long, value_name = "REF")]
         base: Option<String>,
+        /// Bring up this app of a monorepo instead of the default one (repeatable; `default` names the top-level app)
+        #[arg(long = "app", value_name = "NAME")]
+        apps: Vec<String>,
+        /// Bring up every app in .wt.toml
+        #[arg(long, conflicts_with = "apps")]
+        all: bool,
     },
     /// Remove a worktree's containers, volumes, copied databases and checkout
     ///
@@ -92,7 +98,12 @@ fn main() -> ExitCode {
     });
 
     let result = match cli.command {
-        Command::Up { branch, base } => cmd::up::run(&branch, base.as_deref()),
+        Command::Up {
+            branch,
+            base,
+            apps,
+            all,
+        } => cmd::up::run(&branch, base.as_deref(), &apps, all),
         Command::Down {
             slug,
             keep_checkout,
@@ -123,5 +134,21 @@ fn main() -> ExitCode {
             eprintln!("error: {e:#}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::Cli;
+
+    #[test]
+    fn app_and_all_contradict_each_other() {
+        assert!(Cli::try_parse_from(["wt", "up", "feat/x", "--app", "b", "--all"]).is_err());
+        assert!(
+            Cli::try_parse_from(["wt", "up", "feat/x", "--app", "b", "--app", "default"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["wt", "up", "feat/x", "--all"]).is_ok());
     }
 }

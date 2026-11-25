@@ -30,6 +30,17 @@ pub enum Kind {
 impl Kind {
     pub const ALL: [Kind; 3] = [Kind::Postgres, Kind::Mysql, Kind::Redis];
 
+    /// Whether two source database names are one database. With
+    /// lower_case_table_names set, MySQL stores names lowercased (1, the
+    /// Windows default) or compares them without case (2, the macOS
+    /// default), so it folds case; Postgres names are case-sensitive.
+    pub fn same_database(self, a: &str, b: &str) -> bool {
+        match self {
+            Kind::Mysql => a.eq_ignore_ascii_case(b),
+            _ => a == b,
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Kind::Postgres => "postgres",

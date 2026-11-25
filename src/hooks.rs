@@ -11,7 +11,9 @@ use crate::sh;
 /// Runs each argv in order, without a shell, in its `dir` under `root`; the
 /// first failure aborts. Each dir is checked right before its own hook, so an
 /// earlier hook may create it, and the resolved path is what the hook gets.
-/// `config` is the file the hooks came from, named in the errors.
+/// `phase` is the phase's key in `.wt.toml` (`hooks.setup`,
+/// `apps.<name>.hooks.setup`) and `config` the file it came from, both named
+/// in the errors.
 pub fn run(
     phase: &str,
     hooks: &[Hook],
@@ -21,7 +23,7 @@ pub fn run(
 ) -> Result<()> {
     for (i, hook) in hooks.iter().enumerate() {
         let Some((program, args)) = hook.argv.split_first() else {
-            bail!("hooks.{phase}[{i}] is an empty command");
+            bail!("{phase}[{i}] is an empty command");
         };
         let cwd = dir(phase, i, hook, root, config)?;
         let line = hook.argv.join(" ");
@@ -31,7 +33,7 @@ pub fn run(
             println!("→ ({}) {line}", hook.dir.display());
         }
         sh::run(&mut command(program, args, &cwd, env))
-            .with_context(|| format!("hooks.{phase}[{i}] failed: {line} (in {})", cwd.display()))?;
+            .with_context(|| format!("{phase}[{i}] failed: {line} (in {})", cwd.display()))?;
     }
     Ok(())
 }
@@ -61,7 +63,7 @@ fn not_yet_there(phase: &str, hooks: &[Hook], skip: usize, root: &Path) -> Vec<S
         })
         .map(|(i, hook)| {
             format!(
-                "hooks.{phase}[{i}] runs in {}, which does not exist yet; an earlier hook must create it",
+                "{phase}[{i}] runs in {}, which does not exist yet; an earlier hook must create it",
                 hook.dir.display()
             )
         })
@@ -72,17 +74,34 @@ fn not_yet_there(phase: &str, hooks: &[Hook], skip: usize, root: &Path) -> Vec<S
 /// still create. setup[0] has no earlier hook, so `run` fails on it right
 /// away; after_services[0] can only be created by a setup hook, so without
 /// setup it is left to the check `up` makes once setup ends.
-pub fn early_notes(setup: &[Hook], after_services: &[Hook], root: &Path) -> Vec<String> {
-    let mut notes = not_yet_there("setup", setup, 1, root);
+/// `prefix` is the app's key prefix (`apps.<name>.`, empty for the default).
+pub fn early_notes(
+    prefix: &str,
+    setup: &[Hook],
+    after_services: &[Hook],
+    root: &Path,
+) -> Vec<String> {
+    let mut notes = not_yet_there(&format!("{prefix}hooks.setup"), setup, 1, root);
     let skip = usize::from(setup.is_empty());
-    notes.extend(not_yet_there("after_services", after_services, skip, root));
+    notes.extend(not_yet_there(
+        &format!("{prefix}hooks.after_services"),
+        after_services,
+        skip,
+        root,
+    ));
     notes
 }
 
 /// The hook's working directory with symlinks resolved: an existing directory
 /// still inside the worktree.
 pub fn dir(phase: &str, i: usize, hook: &Hook, root: &Path, config: &Path) -> Result<PathBuf> {
-    let key = format!("hooks.{phase}[{i}]");
+    inside(&format!("{phase}[{i}] runs in"), &hook.dir, root, config)
+}
+
+/// `root.join(rel)` with symlinks resolved: an existing directory still
+/// inside the worktree. `subject` opens each error ("hooks.setup[0] runs in",
+/// "apps.b.dir is"), and `config` is the file to fix.
+pub fn inside(subject: &str, rel: &Path, root: &Path, config: &Path) -> Result<PathBuf> {
     let again = format!(
         "fix {} or the checkout and run wt up again; the worktree is kept",
         config.display()
@@ -90,27 +109,26 @@ pub fn dir(phase: &str, i: usize, hook: &Hook, root: &Path, config: &Path) -> Re
     let real_root = root
         .canonicalize()
         .with_context(|| format!("could not resolve the worktree {}", root.display()))?;
-    let dir = root.join(&hook.dir);
+    let dir = root.join(rel);
     let shown = dir.display();
     let meta = match fs::metadata(&dir) {
         Ok(meta) => meta,
         Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
-            bail!("{key} runs in {shown}, which does not exist in the checkout; {again}")
+            bail!("{subject} {shown}, which does not exist in the checkout; {again}")
         }
         Err(e) => {
-            return Err(e)
-                .with_context(|| format!("{key} runs in {shown}, which could not be read"));
+            return Err(e).with_context(|| format!("{subject} {shown}, which could not be read"));
         }
     };
     if !meta.is_dir() {
-        bail!("{key} runs in {shown}, which is not a directory; {again}");
+        bail!("{subject} {shown}, which is not a directory; {again}");
     }
     let real = dir
         .canonicalize()
-        .with_context(|| format!("{key} runs in {shown}, which could not be resolved"))?;
+        .with_context(|| format!("{subject} {shown}, which could not be resolved"))?;
     if !real.starts_with(&real_root) {
         bail!(
-            "{key} runs in {shown}, which leaves the worktree (it resolves to {}); {again}",
+            "{subject} {shown}, which leaves the worktree (it resolves to {}); {again}",
             real.display()
         );
     }
@@ -128,7 +146,7 @@ mod tests {
     const CFG: &str = "/cfg/.wt.toml";
 
     fn run(phase: &str, hooks: &[Hook], root: &Path, env: &[(String, String)]) -> Result<()> {
-        super::run(phase, hooks, root, env, Path::new(CFG))
+        super::run(&format!("hooks.{phase}"), hooks, root, env, Path::new(CFG))
     }
 
     fn hook(argv: &[&str], dir: &str) -> Hook {
@@ -311,14 +329,14 @@ mod tests {
             hook(&["true"], "gen"),
             hook(&["true"], "afile/sub"),
         ];
-        let notes = not_yet_there("after_services", &hooks, 1, &root);
+        let notes = not_yet_there("hooks.after_services", &hooks, 1, &root);
         assert_eq!(notes.len(), 2, "{notes:?}");
         assert!(
             notes[0].contains("hooks.after_services[3]") && notes[0].contains("gen"),
             "{notes:?}"
         );
         assert!(notes[1].contains("hooks.after_services[4]"), "{notes:?}");
-        assert_eq!(not_yet_there("setup", &hooks, 0, &root).len(), 3);
+        assert_eq!(not_yet_there("hooks.setup", &hooks, 0, &root).len(), 3);
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -327,14 +345,14 @@ mod tests {
         let root = scratch("early");
         let missing = [hook(&["true"], "gen"), hook(&["true"], "gen2")];
         // setup[0] has no earlier hook; setup[1] may be created by setup[0].
-        let notes = early_notes(&missing, &[], &root);
+        let notes = early_notes("", &missing, &[], &root);
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(notes[0].contains("hooks.setup[1]"), "{notes:?}");
         // With setup, after_services[0] may still be created by it.
-        let notes = early_notes(&[hook(&["true"], ".")], &missing, &root);
+        let notes = early_notes("", &[hook(&["true"], ".")], &missing, &root);
         assert_eq!(notes.len(), 2, "{notes:?}");
         // Without setup, nothing can create after_services[0]'s dir.
-        let notes = early_notes(&[], &missing, &root);
+        let notes = early_notes("", &[], &missing, &root);
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(notes[0].contains("hooks.after_services[1]"), "{notes:?}");
         fs::remove_dir_all(&root).unwrap();
@@ -344,11 +362,18 @@ mod tests {
     fn dir_resolves_a_single_hook_with_the_same_rules() {
         let root = scratch("single");
         let cfg = Path::new(CFG);
-        let ok = dir("after_services", 0, &hook(&["x"], "apps/web"), &root, cfg).unwrap();
+        let ok = dir(
+            "hooks.after_services",
+            0,
+            &hook(&["x"], "apps/web"),
+            &root,
+            cfg,
+        )
+        .unwrap();
         assert_eq!(ok, root.canonicalize().unwrap().join("apps/web"));
         let err = format!(
             "{:#}",
-            dir("after_services", 0, &hook(&["x"], "nope"), &root, cfg).unwrap_err()
+            dir("hooks.after_services", 0, &hook(&["x"], "nope"), &root, cfg).unwrap_err()
         );
         assert!(
             err.contains("hooks.after_services[0]") && err.contains("does not exist"),
@@ -411,6 +436,45 @@ mod tests {
     fn an_empty_argv_is_an_error_not_a_panic() {
         let root = scratch("empty");
         assert!(run("setup", &[hook(&[], ".")], &root, &[]).is_err());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_apps_notes_carry_its_prefix() {
+        let root = scratch("prefix");
+        let notes = early_notes(
+            "apps.b.",
+            &[hook(&["true"], "."), hook(&["true"], "gen")],
+            &[],
+            &root,
+        );
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].starts_with("apps.b.hooks.setup[1]"), "{notes:?}");
+        let notes = early_notes(
+            "apps.b.",
+            &[hook(&["true"], ".")],
+            &[hook(&["true"], "gen")],
+            &root,
+        );
+        assert!(
+            notes[0].starts_with("apps.b.hooks.after_services[0]"),
+            "{notes:?}"
+        );
+        let e = format!(
+            "{:#}",
+            dir(
+                "apps.b.hooks.after_services",
+                0,
+                &hook(&["x"], "nope"),
+                &root,
+                Path::new(CFG)
+            )
+            .unwrap_err()
+        );
+        assert!(
+            e.starts_with("apps.b.hooks.after_services[0] runs in"),
+            "{e}"
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 }

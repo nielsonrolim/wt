@@ -121,10 +121,6 @@ impl State {
     }
 
     /// One app's state, if it has any; the default app always has one.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "wt up --app uses it in multi-app milestone 3")
-    )]
     pub fn app(&self, id: &AppId) -> Option<&AppState> {
         match id {
             AppId::Default => Some(&self.default),
@@ -132,10 +128,9 @@ impl State {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "wt up --app uses it in multi-app milestone 3")
-    )]
+    /// One app's state to change, created empty when the app has none yet:
+    /// read with `app(id).cloned().unwrap_or_default()` instead, so a read
+    /// never adds an entry.
     pub fn app_mut(&mut self, id: &AppId) -> &mut AppState {
         match id {
             AppId::Default => &mut self.default,
