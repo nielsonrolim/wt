@@ -121,10 +121,10 @@ root = "~/.herdr/worktrees/<project>"     # where worktrees live
 [app]
 port_env = "PORT"           # key that receives the web port; "" turns the web port off
 port_range = [3001, 3099]
-env_file = ".env"           # copied from the main checkout the first time, then rewritten in place (0600)
+env_file = ".env"           # relative to the worktree root and inside it; copied from the main checkout the first time, then rewritten in place (0600)
 envrc = true                # writes an .envrc exporting the web port (skipped if the repo tracks one)
-copy = []                   # untracked paths copied from the main checkout, never overwritten
-refresh = []                # like copy, but replaced whenever the main checkout's file differs
+copy = []                   # untracked paths (relative to the worktree root, inside it) copied from the main checkout, never overwritten
+refresh = []                # like copy, but replaced whenever the main checkout's file differs; never over the app's env file, .envrc or SQLite files
 
 [services.postgres]         # the same options apply to [services.mysql] and [services.redis]
 source = "<project>-postgres-1"   # the source container; defaults to the name compose gives it
@@ -138,7 +138,7 @@ database = "postgres"             # postgres in container mode: the check target
 check_sql = "select 1"            # postgres only: the query that check runs; needs database in container mode, runs on the primary copy in database mode
 
 [services.sqlite]
-files = []                  # required: files relative to the repo root
+files = []                  # required: files relative to the worktree root, inside it
 
 [docker]
 legacy_names = false        # true: the Postgres clone is <project>-wt-<slug>, its volume <project>-wt-<slug>-db
@@ -148,6 +148,9 @@ legacy_names = false        # true: the Postgres clone is <project>-wt-<slug>, i
 # dir = "apps/web"          # where hooks run, relative to the worktree; default: its root
 setup = []                  # before the services
 after_services = []         # once the services are ready
+
+# [apps.<name>]             # another app of a monorepo; see "Several apps in one repo"
+# dir = "apps/<name>"
 ```
 
 ### Services
@@ -252,6 +255,54 @@ An empty, absolute or escaping `dir` is refused when `.wt.toml` loads, before `w
 Version managers that use shims (asdf, mise shims) read `.tool-versions` or `mise.toml` from the hook's `dir` and its parents, so they already pick the right versions. One that activates through your shell (`mise activate`, direnv) does not: the hook inherits the `PATH` and other variables set up for the directory where you typed `wt up`. Wrap the command so it resolves in the hook's `dir`, for example `["mise", "exec", "--", "bundle", "install"]` or `["direnv", "exec", ".", "bundle", "install"]`. `mise exec` trusts the config it loads, and trust given in the main checkout carries over to its worktrees (unless mise's paranoid mode is on). direnv allows each path separately, so a new worktree's `.envrc` is blocked until a hook such as `["direnv", "allow", "."]` runs first.
 
 Hooks get these variables in their environment: `WT_SLUG`, `WT_BRANCH`, `WT_PATH`, `WT_MAIN_ROOT`, `WT_APP_PORT`, and `WT_POSTGRES_PORT`/`WT_MYSQL_PORT`/`WT_REDIS_PORT` for the configured services only. In `mode = "database"`, they also get `WT_POSTGRES_DATABASE`/`WT_MYSQL_DATABASE` (the primary copy's name) and `WT_POSTGRES_DATABASES`/`WT_MYSQL_DATABASES` (`source=target,source=target`).
+
+### Several apps in one repo
+
+In a monorepo, the top-level `[app]`, `[services.*]` and `[hooks]` describe the **default app**, exactly as in a one-app repo. Each `[apps.<name>]` table adds another app of the same worktree, with its own env file, copy and refresh paths, services, web port and hooks. A `.wt.toml` without `[apps.*]` is a one-app config.
+
+A one-app config behaves as before, except that paths are now checked in every app, the default one included. A config that loaded in wt 0.4 now fails to load, in `wt up`, `wt ls` and `wt down` alike, when:
+
+- `env_file`, a `copy` or `refresh` path, or a `sqlite.files` entry is empty, absolute, or climbs out of the worktree with `..`;
+- `copy` and `refresh` overlap once normalized (`./storage` is `storage`, and `.` covers everything);
+- `refresh` covers the app's own env file, `.envrc` or SQLite files, which `refresh` would replace with the main checkout's copy on every run;
+- two outputs share a path, such as `env_file = ".envrc"` while the app writes an `.envrc`.
+
+([`examples/monorepo.wt.toml`](examples/monorepo.wt.toml))
+
+```toml
+# The default app: apps/platform.
+[app]
+env_file = "apps/platform/.env"
+
+[services.postgres]
+database = "platform_development"
+
+[hooks]
+dir = "apps/platform"
+setup = [["bundle", "install"], { run = ["bun", "install"], dir = "." }]
+
+# Another app, with its own compose project.
+[apps.coa-api]
+dir = "apps/coa-api"            # required: the app's folder in the worktree
+
+[apps.coa-api.app]
+port_env = "COA_API_PORT"
+port_range = [8001, 8099]
+
+[apps.coa-api.services.postgres]
+source = "coa-api-postgres-1"
+database = "coa_references"
+
+[apps.coa-api.hooks]
+setup = [["uv", "sync"]]
+```
+
+- `dir` supplies the app's defaults: `env_file` is `<dir>/.env`, hooks run in `<dir>`, and its `.envrc` goes in `<dir>`. Paths you write yourself (`env_file`, `copy`, `refresh`, `sqlite.files`, `hooks.dir`) stay relative to the worktree root.
+- An app's tables take the same keys as the top-level ones, except `project`, `root`, `[docker]` and `[apps]`, which describe the whole worktree. Each of its Postgres, MySQL and Redis services must set `source`: the compose default (`<project>-<type>-1`) is the default app's container.
+- An app name is lowercase letters and digits, with single dashes between them, at most 30 characters; `default` is reserved.
+- `.wt.toml` is refused when two apps would write the same env file, `.envrc` or SQLite file; when one app's `copy` or `refresh` overlaps another's, or covers another app's env file, `.envrc` or SQLite files; when two apps use one source in different modes; and when two apps copy from one source in `mode = "database"` without naming their databases (`database` or `databases`), or name databases whose copies would get the same name.
+
+Bringing these apps up is not implemented yet: today `wt up`, `wt ls` and `wt down` only act on the default app (`wt up` says so), and the `[apps.*]` tables are only checked. They are checked by `wt up`, `wt ls` and `wt down`, so an invalid `[apps.*]` table stops `wt up`, `wt ls` and `wt down` alike. wt 0.4 and older refuse `[apps.*]` altogether.
 
 ## Examples
 

@@ -32,7 +32,14 @@ pub fn run(branch: &str, base: Option<&str>) -> Result<()> {
     if cfg.path.is_none() {
         println!("No .wt.toml found; creating a worktree without services (wt init writes one)");
     }
-    if !cfg.services.is_empty() {
+    if !cfg.extras.is_empty() {
+        let names: Vec<String> = cfg.extras.iter().map(|a| a.id.to_string()).collect();
+        println!(
+            "Note: only the default app comes up; [apps.*] ({}) are checked but not brought up yet",
+            names.join(", ")
+        );
+    }
+    if !cfg.default.services.is_empty() {
         docker::ensure_running()?;
     }
 
@@ -48,7 +55,7 @@ pub fn run(branch: &str, base: Option<&str>) -> Result<()> {
     // missing volume, an unpublished port, a foreign database, a mode change)
     // must leave no worktree, no state and no database behind.
     let mut resolved = Vec::new();
-    for svc in &cfg.services {
+    for svc in &cfg.default.services {
         if services::copies_volume(svc) {
             resolved.push(ServiceUp::Container {
                 source: services::resolve_source(svc)?,
@@ -84,37 +91,41 @@ pub fn run(branch: &str, base: Option<&str>) -> Result<()> {
 
     write_env(&main, &cfg, &env, &next, &resolved)?;
     warn_kept(&cfg, &env, &kept);
-    if let Some(sqlite) = &cfg.sqlite {
+    if let Some(sqlite) = &cfg.default.sqlite {
         files::copy_sqlite(&main, &env.path, &sqlite.files)?;
     }
-    files::copy_paths(&main, &env.path, &cfg.app.copy)?;
-    files::refresh_paths(&main, &env.path, &cfg.app.refresh)?;
+    files::copy_paths(&main, &env.path, &cfg.default.app.copy)?;
+    files::refresh_paths(&main, &env.path, &cfg.default.app.refresh)?;
 
     let hook_env = hook_env(&main, &cfg, &env, branch, &next, &resolved);
     let config_file = cfg
         .path
         .clone()
         .unwrap_or_else(|| main.join(config::FILE_NAME));
-    for note in hooks::early_notes(&cfg.hooks.setup, &cfg.hooks.after_services, &env.path) {
+    for note in hooks::early_notes(
+        &cfg.default.hooks.setup,
+        &cfg.default.hooks.after_services,
+        &env.path,
+    ) {
         eprintln!("warning: {note}");
     }
     hooks::run(
         "setup",
-        &cfg.hooks.setup,
+        &cfg.default.hooks.setup,
         &env.path,
         &hook_env,
         &config_file,
     )?;
     // Once setup is done nothing can create after_services[0]'s dir, so a
     // missing one fails here rather than after the sources are copied.
-    if let Some(first) = cfg.hooks.after_services.first() {
+    if let Some(first) = cfg.default.hooks.after_services.first() {
         hooks::dir("after_services", 0, first, &env.path, &config_file)?;
     }
 
     {
         // Restarts any source still stopped if a step below fails.
         let _restore = RestoreOnDrop;
-        for (svc, plan) in cfg.services.iter().zip(&resolved) {
+        for (svc, plan) in cfg.default.services.iter().zip(&resolved) {
             match plan {
                 ServiceUp::Container { source } => {
                     services::prepare_volume(svc, source, &env)?;
@@ -136,7 +147,7 @@ pub fn run(branch: &str, base: Option<&str>) -> Result<()> {
 
     hooks::run(
         "after_services",
-        &cfg.hooks.after_services,
+        &cfg.default.hooks.after_services,
         &env.path,
         &hook_env,
         &config_file,
@@ -155,7 +166,7 @@ fn refuse_mode_changes(
     previous: &State,
     resolved: &[ServiceUp],
 ) -> Result<()> {
-    for (svc, plan) in cfg.services.iter().zip(resolved) {
+    for (svc, plan) in cfg.default.services.iter().zip(resolved) {
         let container = docker::container(&env.container(svc.kind));
         let volume = docker::volume(&env.volume(svc.kind));
         match plan {
@@ -297,26 +308,26 @@ fn resolve_ports(
     match docker::claimed_host_ports() {
         Ok(ports) => claimed.extend(ports),
         Err(e) => {
-            if !cfg.services.is_empty() {
+            if !cfg.default.services.is_empty() {
                 return Err(e);
             }
         }
     }
 
     let mut next = State::default();
-    if !cfg.app.port_env.is_empty() {
+    if !cfg.default.app.port_env.is_empty() {
         let port = match previous
             .app_port
-            .filter(|p| in_range(*p, cfg.app.port_range))
+            .filter(|p| in_range(*p, cfg.default.app.port_range))
         {
             Some(p) => p,
-            None => ports::find_free(cfg.app.port_range, &claimed)?,
+            None => ports::find_free(cfg.default.app.port_range, &claimed)?,
         };
         claimed.insert(port);
         next.app_port = Some(port);
     }
 
-    for (svc, plan) in cfg.services.iter().zip(resolved) {
+    for (svc, plan) in cfg.default.services.iter().zip(resolved) {
         let name = svc.kind.name();
         let port = match plan {
             ServiceUp::Database { port, .. } => *port,
@@ -379,7 +390,7 @@ fn warn_kept(cfg: &Config, env: &Env, kept: &[DatabaseCopy]) {
     if kept.is_empty() {
         return;
     }
-    let file = env.path.join(&cfg.app.env_file);
+    let file = env.path.join(&cfg.default.app.env_file);
     for copy in kept {
         let key = key_pointing_at(&file, &copy.target)
             .map(|key| format!("; {key} in .env still points at it"))
@@ -401,7 +412,7 @@ fn env_values(
     resolved: &[ServiceUp],
 ) -> Result<Vec<(String, String)>> {
     let mut values = Vec::new();
-    for (svc, plan) in cfg.services.iter().zip(resolved) {
+    for (svc, plan) in cfg.default.services.iter().zip(resolved) {
         let port = state.ports[svc.kind.name()];
         let targets: Vec<(String, String)> = match plan {
             ServiceUp::Database { copies, .. } => copies
@@ -420,7 +431,11 @@ fn env_values(
         }
     }
     if let Some(port) = state.app_port {
-        set_value(&mut values, cfg.app.port_env.clone(), port.to_string());
+        set_value(
+            &mut values,
+            cfg.default.app.port_env.clone(),
+            port.to_string(),
+        );
     }
     Ok(values)
 }
@@ -443,8 +458,8 @@ fn write_env(
     resolved: &[ServiceUp],
 ) -> Result<()> {
     let values = env_values(cfg, state, resolved)?;
-    let target = env.path.join(&cfg.app.env_file);
-    let source = [target.clone(), main.join(&cfg.app.env_file)]
+    let target = env.path.join(&cfg.default.app.env_file);
+    let source = [target.clone(), main.join(&cfg.default.app.env_file)]
         .into_iter()
         .find(|p| p.is_file());
     let text = match source {
@@ -458,16 +473,16 @@ fn write_env(
     }
 
     if let Some(port) = state.app_port
-        && cfg.app.envrc
+        && cfg.default.app.envrc
     {
         if git::is_tracked(&env.path, ".envrc") {
             println!("Skipping .envrc: the repo tracks its own");
         } else {
-            envfile::write_envrc(&env.path, &cfg.app.port_env, port)?;
+            envfile::write_envrc(&env.path, &cfg.default.app.port_env, port)?;
             println!(
                 "Wrote {}/.envrc ({}={port})",
                 env.path.display(),
-                cfg.app.port_env
+                cfg.default.app.port_env
             );
         }
     }
@@ -491,7 +506,7 @@ fn hook_env(
     if let Some(port) = state.app_port {
         vars.push(("WT_APP_PORT".into(), port.to_string()));
     }
-    for (svc, plan) in cfg.services.iter().zip(resolved) {
+    for (svc, plan) in cfg.default.services.iter().zip(resolved) {
         vars.push((
             svc.kind.port_env_var(),
             state.ports[svc.kind.name()].to_string(),
@@ -518,7 +533,7 @@ fn report(cfg: &Config, env: &Env, branch: &str, state: &State, resolved: &[Serv
         env.slug,
         env.path.display()
     );
-    for (svc, plan) in cfg.services.iter().zip(resolved) {
+    for (svc, plan) in cfg.default.services.iter().zip(resolved) {
         let port = state.ports[svc.kind.name()];
         match plan {
             ServiceUp::Container { .. } => {
@@ -541,7 +556,7 @@ fn report(cfg: &Config, env: &Env, branch: &str, state: &State, resolved: &[Serv
         println!(
             "  cd {} && source .envrc   # exports {}={port}",
             env.path.display(),
-            cfg.app.port_env
+            cfg.default.app.port_env
         );
         // Cookies are scoped by host and ignore the port, so worktrees served
         // on localhost share one session jar and sign each other out.

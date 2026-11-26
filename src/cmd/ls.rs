@@ -25,7 +25,7 @@ pub fn run() -> Result<()> {
     };
     // A column for each configured service, and for any a worktree still has
     // from before the config dropped it.
-    let mut kinds: Vec<Kind> = cfg.services.iter().map(|s| s.kind).collect();
+    let mut kinds: Vec<Kind> = cfg.default.services.iter().map(|s| s.kind).collect();
 
     // One query for the whole project, split by slug below.
     let (all_containers, all_volumes) = if docker_ok {
@@ -160,7 +160,7 @@ fn status(
     {
         return verdict;
     }
-    if cfg.services.is_empty() && !has_volumes {
+    if cfg.default.services.is_empty() && !has_volumes {
         "ready"
     } else {
         "no-db"
