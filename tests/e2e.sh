@@ -265,6 +265,19 @@ grep -q '^LOCAL=1$' "$WTP/.env" || fail "hand edit lost"
 [ "$RERUN_STARTED" = "$(docker inspect -f '{{.State.StartedAt}}' "$PROJECT-postgres-1")" ] ||
   fail "a re-run must not touch the source"
 
+step "an unreadable state file stops up and down and stays as it is"
+STATE_FILE="$XDG_STATE_HOME/wt/$PROJECT/feat-x.toml"
+cp "$STATE_FILE" "$WORK/state.bak"
+printf 'app_port = "not a port"\n' >"$STATE_FILE"
+cp "$STATE_FILE" "$WORK/state.bad"
+"$WT" up feat/x >"$WORK/badstate-up.log" 2>&1 && fail "up ran over an unreadable state file"
+grep -q "$STATE_FILE" "$WORK/badstate-up.log" || fail "up did not name the state file: $(cat "$WORK/badstate-up.log")"
+WT_YES=1 "$WT" down feat-x >"$WORK/badstate-down.log" 2>&1 && fail "down ran over an unreadable state file"
+grep -q "$STATE_FILE" "$WORK/badstate-down.log" || fail "down did not name the state file: $(cat "$WORK/badstate-down.log")"
+cmp -s "$STATE_FILE" "$WORK/state.bad" || fail "the unreadable state file was changed"
+[ -d "$WTP" ] || fail "down removed the checkout despite the unreadable state"
+cp "$WORK/state.bak" "$STATE_FILE"
+
 step "a missing after_services dir stops up after setup, before the services, and a fixed config resumes"
 sed -i.bak 's|^dir = "apps/web"$|dir = "apps/nope"|' .wt.toml && rm -f .wt.toml.bak
 rm -f "$WTP/hook-setup.out"

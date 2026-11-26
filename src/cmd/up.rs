@@ -9,7 +9,7 @@ use crate::database::{self, MarkerState};
 use crate::docker::{Container, Volume};
 use crate::project::{self, Env};
 use crate::services::{self, ContainerSource, RestoreOnDrop, Source};
-use crate::state::{self, DatabaseCopy, State};
+use crate::state::{self, AppState, DatabaseCopy, State};
 use crate::{docker, envfile, files, git, herdr, hooks, ports};
 
 /// The resolved plan for one service, before anything is created.
@@ -49,7 +49,7 @@ pub fn run(branch: &str, base: Option<&str>) -> Result<()> {
     }
     fs::create_dir_all(&cfg.root)?;
     let env = Env::new(&cfg, &slug);
-    let previous = State::load(&env.project, &env.slug);
+    let previous = State::load_strict(&env.project, &env.slug)?;
 
     // Every source is resolved before the checkout exists: a refused run (a
     // missing volume, an unpublished port, a foreign database, a mode change)
@@ -72,15 +72,15 @@ pub fn run(branch: &str, base: Option<&str>) -> Result<()> {
                 );
             }
             let port = services::host_port_for(&src)?;
-            let copies = database::plan(svc, &src, &env, &previous.databases)?;
+            let copies = database::plan(svc, &src, &env, &previous.default.databases)?;
             resolved.push(ServiceUp::Database { src, port, copies });
         }
     }
     refuse_mode_changes(&cfg, &env, &previous, &resolved)?;
 
-    let mut next = resolve_ports(&cfg, &env, &previous, &resolved)?;
+    let mut next = next_state(&previous, resolve_ports(&cfg, &env, &previous, &resolved)?);
     let (databases, kept) = planned_databases(&previous, &resolved);
-    next.databases = databases;
+    next.default.databases = databases;
     // Rendered once here so a value that cannot be rendered is refused before
     // the checkout and the state exist.
     env_values(&cfg, &next, &resolved)?;
@@ -129,7 +129,7 @@ pub fn run(branch: &str, base: Option<&str>) -> Result<()> {
             match plan {
                 ServiceUp::Container { source } => {
                     services::prepare_volume(svc, source, &env)?;
-                    services::start(svc, source, &env, next.ports[svc.kind.name()])?;
+                    services::start(svc, source, &env, next.default.ports[svc.kind.name()])?;
                     services::wait_ready(svc, source, &env)?;
                 }
                 ServiceUp::Database { src, copies, .. } => {
@@ -174,7 +174,7 @@ fn refuse_mode_changes(
                 refuse_leftover(svc.kind, svc.mode, container.as_ref(), volume.as_ref(), env)?
             }
             ServiceUp::Container { .. } => refuse_copies(
-                &previous.databases,
+                &previous.default.databases,
                 svc.kind,
                 svc.mode,
                 container.as_ref(),
@@ -292,6 +292,16 @@ fn create_worktree(main: &Path, env: &Env, branch: &str, base: Option<&str>) -> 
     Ok(())
 }
 
+/// The state `up` saves: the default app's fresh ports, and every extra app's
+/// entry as the previous run left it, so a plain `wt up` never drops another
+/// app's ports from the registry or its copies from `down`'s list.
+fn next_state(previous: &State, default: AppState) -> State {
+    State {
+        default,
+        ..previous.clone()
+    }
+}
+
 /// Re-runs must land on the same ports, or the .env and the containers
 /// disagree: the published port wins, then the state file, then a free one.
 /// A database-mode service has no port of its own: it uses the source's.
@@ -300,7 +310,7 @@ fn resolve_ports(
     env: &Env,
     previous: &State,
     resolved: &[ServiceUp],
-) -> Result<State> {
+) -> Result<AppState> {
     let mut claimed: HashSet<u16> = state::claimed_ports();
     // Every container's published ports, stopped ones included, so a re-run
     // never hands out a port a stopped clone still owns. Without services
@@ -314,9 +324,10 @@ fn resolve_ports(
         }
     }
 
-    let mut next = State::default();
+    let mut next = AppState::default();
     if !cfg.default.app.port_env.is_empty() {
         let port = match previous
+            .default
             .app_port
             .filter(|p| in_range(*p, cfg.default.app.port_range))
         {
@@ -338,6 +349,7 @@ fn resolve_ports(
                 let published = docker::container(&env.container(svc.kind))
                     .and_then(|c| c.host_ports().first().copied());
                 let recorded = previous
+                    .default
                     .ports
                     .get(name)
                     .copied()
@@ -369,7 +381,7 @@ fn planned_databases(
         })
         .flatten()
         .collect();
-    let reconciled = database::reconcile(&previous.databases, &desired);
+    let reconciled = database::reconcile(&previous.default.databases, &desired);
     let mut all: Vec<DatabaseCopy> = desired.iter().map(|(copy, _)| copy.clone()).collect();
     all.extend(reconciled.keep.iter().cloned());
     (all, reconciled.keep)
@@ -413,7 +425,7 @@ fn env_values(
 ) -> Result<Vec<(String, String)>> {
     let mut values = Vec::new();
     for (svc, plan) in cfg.default.services.iter().zip(resolved) {
-        let port = state.ports[svc.kind.name()];
+        let port = state.default.ports[svc.kind.name()];
         let targets: Vec<(String, String)> = match plan {
             ServiceUp::Database { copies, .. } => copies
                 .iter()
@@ -430,7 +442,7 @@ fn env_values(
             set_value(&mut values, k, v);
         }
     }
-    if let Some(port) = state.app_port {
+    if let Some(port) = state.default.app_port {
         set_value(
             &mut values,
             cfg.default.app.port_env.clone(),
@@ -472,7 +484,7 @@ fn write_env(
         println!("Wrote {} ({})", target.display(), summary.join(", "));
     }
 
-    if let Some(port) = state.app_port
+    if let Some(port) = state.default.app_port
         && cfg.default.app.envrc
     {
         if git::is_tracked(&env.path, ".envrc") {
@@ -503,13 +515,13 @@ fn hook_env(
         ("WT_PATH".into(), env.path.display().to_string()),
         ("WT_MAIN_ROOT".into(), main.display().to_string()),
     ];
-    if let Some(port) = state.app_port {
+    if let Some(port) = state.default.app_port {
         vars.push(("WT_APP_PORT".into(), port.to_string()));
     }
     for (svc, plan) in cfg.default.services.iter().zip(resolved) {
         vars.push((
             svc.kind.port_env_var(),
-            state.ports[svc.kind.name()].to_string(),
+            state.default.ports[svc.kind.name()].to_string(),
         ));
         if let ServiceUp::Database { copies, .. } = plan {
             let upper = svc.kind.name().to_uppercase();
@@ -534,7 +546,7 @@ fn report(cfg: &Config, env: &Env, branch: &str, state: &State, resolved: &[Serv
         env.path.display()
     );
     for (svc, plan) in cfg.default.services.iter().zip(resolved) {
-        let port = state.ports[svc.kind.name()];
+        let port = state.default.ports[svc.kind.name()];
         match plan {
             ServiceUp::Container { .. } => {
                 println!("  {:<9} 127.0.0.1:{port}", svc.kind.name());
@@ -552,7 +564,7 @@ fn report(cfg: &Config, env: &Env, branch: &str, state: &State, resolved: &[Serv
             }
         }
     }
-    if let Some(port) = state.app_port {
+    if let Some(port) = state.default.app_port {
         println!(
             "  cd {} && source .envrc   # exports {}={port}",
             env.path.display(),
@@ -607,6 +619,7 @@ mod tests {
             path: "/tmp/wt-test-db-legacy".into(),
             legacy_names: false,
             slug_label: None,
+            app: crate::config::AppId::Default,
         }
     }
 
@@ -743,5 +756,22 @@ mod tests {
             .is_ok()
         );
         assert!(refuse_copies(&[], services::Kind::Postgres, Mode::Container, None, &env).is_ok());
+    }
+
+    #[test]
+    fn a_default_up_keeps_the_extra_apps_state() {
+        use crate::config::{AppId, AppName};
+        let mut previous = State::default();
+        previous.default.app_port = Some(3001);
+        let api = AppId::Extra(AppName::parse("coa-api").unwrap());
+        previous.app_mut(&api).app_port = Some(8001);
+        previous.app_mut(&api).ports.insert("postgres".into(), 5434);
+        let default = crate::state::AppState {
+            app_port: Some(3002),
+            ..Default::default()
+        };
+        let next = next_state(&previous, default);
+        assert_eq!(next.default.app_port, Some(3002));
+        assert_eq!(next.apps, previous.apps);
     }
 }

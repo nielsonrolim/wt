@@ -8,7 +8,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result, bail};
 
-use crate::config::{Service, map_placeholders};
+use crate::config::{AppName, Service, map_placeholders};
 use crate::docker::{self, Container};
 use crate::project::Env;
 use crate::services::ContainerSource;
@@ -51,14 +51,25 @@ fn fnv1a(text: &str) -> u64 {
 
 /// Deterministic and independent of the list order: the suffix comes from the
 /// source database's name, never its position.
-pub fn target_name(project: &str, slug: &str, database: &str) -> String {
-    let base = format!("wt_{}_{}", sanitize(project), sanitize(slug));
+///
+/// An extra app's targets put the app between two `__`: `sanitize` never emits
+/// `__`, so in an untruncated name one marks the default app and two an extra,
+/// and no slug can make one look like the other. When too long, the app goes
+/// into the hash instead.
+pub fn target_name(project: &str, slug: &str, app: Option<&AppName>, database: &str) -> String {
+    let mut base = format!("wt_{}_{}", sanitize(project), sanitize(slug));
+    if let Some(app) = app {
+        base = format!("{base}__{}", sanitize(app.as_str()));
+    }
     let suffix = sanitize(database);
     let full = format!("{base}__{suffix}");
     if full.len() <= MAX_NAME {
         return full;
     }
-    let hash = fnv1a(&format!("{project}\0{slug}\0{database}"));
+    let hash = match app {
+        None => fnv1a(&format!("{project}\0{slug}\0{database}")),
+        Some(app) => fnv1a(&format!("{project}\0{slug}\0{app}\0{database}")),
+    };
     let prefix = format!("wt_{:08x}__", hash as u32);
     let budget = MAX_NAME - prefix.len();
     format!("{prefix}{}", shorten(&suffix, budget))
@@ -76,14 +87,19 @@ fn shorten(text: &str, budget: usize) -> String {
 /// The target for every source database, refusing two names that sanitize to
 /// the same target, a name with no usable characters, and a target that is
 /// itself one of the sources.
-pub fn targets(project: &str, slug: &str, databases: &[String]) -> Result<Vec<(String, String)>> {
+pub fn targets(
+    project: &str,
+    slug: &str,
+    app: Option<&AppName>,
+    databases: &[String],
+) -> Result<Vec<(String, String)>> {
     let mut out = Vec::new();
     let mut seen: BTreeMap<String, String> = BTreeMap::new();
     for database in databases {
         if sanitize(database).is_empty() {
             bail!("database name {database:?} has no characters usable in a target");
         }
-        let target = target_name(project, slug, database);
+        let target = target_name(project, slug, app, database);
         check_not_self(database, &target)?;
         if let Some(other) = seen.get(&target) {
             bail!("databases {other:?} and {database:?} both map to {target}");
@@ -215,9 +231,9 @@ pub fn is_registered(previous: &[DatabaseCopy], copy: &DatabaseCopy) -> bool {
 }
 
 /// A state file can be stale or edited, so an unmarked target also has to carry
-/// the name wt would give this source database in this worktree.
-pub fn has_own_name(copy: &DatabaseCopy, project: &str, slug: &str) -> bool {
-    target_name(project, slug, &copy.source_db) == copy.target
+/// the name wt would give this source database in this app of this worktree.
+pub fn has_own_name(copy: &DatabaseCopy, project: &str, slug: &str, app: Option<&AppName>) -> bool {
+    target_name(project, slug, app, &copy.source_db) == copy.target
 }
 
 // ---------------------------------------------------------------------------
@@ -719,7 +735,7 @@ pub fn plan(
         );
     }
     let databases = source_databases(svc, &src.container)?;
-    let targets = targets(&env.project, &env.slug, &databases)?;
+    let targets = targets(&env.project, &env.slug, env.app.name(), &databases)?;
     let mut out = Vec::new();
     for (source_db, target) in targets {
         // A typo or a renamed source must fail here, before the checkout and
@@ -1129,18 +1145,20 @@ pub fn verify(svc: &Service, src: &ContainerSource, target: &str) -> Result<()> 
 /// place. Returns false when it had to leave the state alone (source stopped or
 /// gone), so the caller can keep the registry for later.
 pub fn drop_all(
-    copies: &[DatabaseCopy],
-    env: &Env,
+    copies: &[(Env, &DatabaseCopy)],
     force: bool,
     protected: &BTreeSet<String>,
 ) -> Result<bool> {
     let mut droppable = Vec::new();
     let mut finished = true;
-    for copy in copies {
+    for (env, copy) in copies {
+        let copy = *copy;
         // A tampered state must never make `down` drop a source database.
         if copy.source_db == copy.target
             || protected.contains(&copy.target)
-            || copies.iter().any(|other| other.source_db == copy.target)
+            || copies
+                .iter()
+                .any(|(_, other)| other.source_db == copy.target)
         {
             bail!(
                 "refusing to drop {}: it is the source database",
@@ -1184,7 +1202,7 @@ fn may_drop(state: MarkerState, copy: &DatabaseCopy, env: &Env, force: bool) -> 
     let ours = match state {
         MarkerState::Missing => return Ok(false),
         MarkerState::Foreign => false,
-        MarkerState::Unmarked => has_own_name(copy, &env.project, &env.slug),
+        MarkerState::Unmarked => has_own_name(copy, &env.project, &env.slug, env.app.name()),
         MarkerState::Adopt | MarkerState::Recreate | MarkerState::Reuse => true,
     };
     if !ours && !force {
@@ -1206,6 +1224,7 @@ pub fn primary(copies: &[DatabaseCopy]) -> Option<&DatabaseCopy> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AppId, AppName};
 
     fn db(service: &str, source_db: &str, target: &str) -> DatabaseCopy {
         DatabaseCopy {
@@ -1219,7 +1238,7 @@ mod tests {
     #[test]
     fn target_name_is_namespaced() {
         assert_eq!(
-            target_name("wte2e", "feat-x", "app"),
+            target_name("wte2e", "feat-x", None, "app"),
             "wt_wte2e_feat_x__app"
         );
     }
@@ -1227,25 +1246,25 @@ mod tests {
     #[test]
     fn target_name_sanitizes() {
         assert_eq!(
-            target_name("wte2e", "feat-x", "My-App.cache v2"),
+            target_name("wte2e", "feat-x", None, "My-App.cache v2"),
             "wt_wte2e_feat_x__my_app_cache_v2"
         );
-        assert_eq!(target_name("P_A", "feat-x", "a"), "wt_p_a_feat_x__a");
+        assert_eq!(target_name("P_A", "feat-x", None, "a"), "wt_p_a_feat_x__a");
     }
 
     #[test]
     fn long_names_are_capped_and_stable() {
         let a = "a".repeat(80);
         let b = format!("{}b", "a".repeat(79));
-        let first = target_name("wte2e", "feat-x", &a);
-        let second = target_name("wte2e", "feat-x", &b);
+        let first = target_name("wte2e", "feat-x", None, &a);
+        let second = target_name("wte2e", "feat-x", None, &b);
         assert!(first.len() <= MAX_NAME, "{}", first.len());
         assert!(second.len() <= MAX_NAME, "{}", second.len());
         assert_eq!(first.len(), MAX_NAME);
         assert_eq!(second.len(), MAX_NAME);
         assert_ne!(first, second);
         assert!(first.starts_with("wt_"));
-        assert_eq!(target_name("wte2e", "feat-x", &a), first);
+        assert_eq!(target_name("wte2e", "feat-x", None, &a), first);
     }
 
     #[test]
@@ -1253,8 +1272,11 @@ mod tests {
         let dbs = vec!["b".to_string(), "a".to_string()];
         let mut sorted = dbs.clone();
         sorted.sort();
-        let one: BTreeMap<_, _> = targets("p", "s", &dbs).unwrap().into_iter().collect();
-        let two: BTreeMap<_, _> = targets("p", "s", &sorted).unwrap().into_iter().collect();
+        let one: BTreeMap<_, _> = targets("p", "s", None, &dbs).unwrap().into_iter().collect();
+        let two: BTreeMap<_, _> = targets("p", "s", None, &sorted)
+            .unwrap()
+            .into_iter()
+            .collect();
         assert_eq!(one, two);
     }
 
@@ -1262,13 +1284,13 @@ mod tests {
     fn colliding_targets_are_refused() {
         let err = format!(
             "{:#}",
-            targets("p", "s", &["app-db".into(), "app.db".into()]).unwrap_err()
+            targets("p", "s", None, &["app-db".into(), "app.db".into()]).unwrap_err()
         );
         assert!(err.contains("app-db") && err.contains("app.db"), "{err}");
         assert!(err.contains("wt_p_s__app_db"), "{err}");
         let err = format!(
             "{:#}",
-            targets("p", "s", &["a;b".into(), "a b".into()]).unwrap_err()
+            targets("p", "s", None, &["a;b".into(), "a b".into()]).unwrap_err()
         );
         assert!(err.contains("wt_p_s__a_b"), "{err}");
     }
@@ -1440,6 +1462,7 @@ mod tests {
             path: "/w/s".into(),
             legacy_names: false,
             slug_label: None,
+            app: crate::config::AppId::Default,
         }
     }
 
@@ -1452,6 +1475,12 @@ mod tests {
         let other = db("postgres", "app", "billing");
         assert!(may_drop(MarkerState::Unmarked, &other, &env, false).is_err());
         assert!(may_drop(MarkerState::Unmarked, &other, &env, true).unwrap());
+        // An extra app's copy carries the app in its name.
+        let extra = test_env().with_app(&AppId::Extra(AppName::parse("b").unwrap()));
+        let theirs = db("postgres", "app", "wt_p_s__b__app");
+        assert!(may_drop(MarkerState::Unmarked, &theirs, &extra, false).unwrap());
+        assert!(may_drop(MarkerState::Unmarked, &theirs, &env, false).is_err());
+        assert!(may_drop(MarkerState::Unmarked, &own, &extra, false).is_err());
     }
 
     #[test]
@@ -1606,15 +1635,21 @@ mod tests {
 
     #[test]
     fn refuses_names_without_usable_characters() {
-        assert!(targets("p", "s", &["日本".to_string()]).is_err());
-        assert!(targets("p", "s", &[String::new()]).is_err());
+        assert!(targets("p", "s", None, &["日本".to_string()]).is_err());
+        assert!(targets("p", "s", None, &[String::new()]).is_err());
     }
 
     #[test]
     fn refuses_a_target_that_is_another_source() {
         let err = format!(
             "{:#}",
-            targets("p", "s", &["app".to_string(), "wt_p_s__app".to_string()]).unwrap_err()
+            targets(
+                "p",
+                "s",
+                None,
+                &["app".to_string(), "wt_p_s__app".to_string()]
+            )
+            .unwrap_err()
         );
         assert!(err.contains("also a source database"), "{err}");
     }
@@ -1637,7 +1672,7 @@ mod tests {
 
     #[test]
     fn first_database_is_the_primary() {
-        let targets = targets("p", "s", &["cache".into(), "app".into()]).unwrap();
+        let targets = targets("p", "s", None, &["cache".into(), "app".into()]).unwrap();
         let copies: Vec<DatabaseCopy> = targets
             .into_iter()
             .map(|(source_db, target)| db("postgres", &source_db, &target))
@@ -1744,5 +1779,98 @@ mod tests {
 
         let duplicated = reconcile(&[app.clone(), app.clone()], &[(app, MarkerState::Reuse)]);
         assert!(duplicated.keep.is_empty());
+    }
+
+    // ---- Several apps ----
+
+    #[test]
+    fn an_extras_target_carries_the_app_between_double_underscores() {
+        assert_eq!(
+            target_name("wte2e", "feat-x", Some(&app("coa-api")), "app"),
+            "wt_wte2e_feat_x__coa_api__app"
+        );
+        // The default app's name is unchanged.
+        assert_eq!(
+            target_name("wte2e", "feat-x", None, "app"),
+            "wt_wte2e_feat_x__app"
+        );
+        // slug feat + app coa-api never meets the default app of slug feat-coa-api.
+        assert_ne!(
+            target_name("p", "feat", Some(&app("coa-api")), "db"),
+            target_name("p", "feat-coa-api", None, "db")
+        );
+        assert_ne!(
+            target_name("p", "feat", Some(&app("coa-api")), "db"),
+            target_name("p", "feat", None, "coa_api__db")
+        );
+    }
+
+    #[test]
+    fn a_long_extra_target_hashes_the_app_too() {
+        let db = "a".repeat(80);
+        let one = target_name("p", "s", Some(&app("x")), &db);
+        let two = target_name("p", "s", Some(&app("y")), &db);
+        let default = target_name("p", "s", None, &db);
+        assert!(one.len() <= MAX_NAME && two.len() <= MAX_NAME);
+        assert_ne!(one, two);
+        assert_ne!(one, default);
+    }
+
+    #[test]
+    fn targets_and_own_names_follow_the_app() {
+        let t = targets("p", "s", Some(&app("b")), &["app".into()]).unwrap();
+        assert_eq!(t, [("app".to_string(), "wt_p_s__b__app".to_string())]);
+        let copy = DatabaseCopy {
+            service: "postgres".into(),
+            source: "pg".into(),
+            source_db: "app".into(),
+            target: "wt_p_s__b__app".into(),
+        };
+        assert!(has_own_name(&copy, "p", "s", Some(&app("b"))));
+        assert!(!has_own_name(&copy, "p", "s", None));
+    }
+
+    fn app(name: &str) -> AppName {
+        AppName::parse(name).unwrap()
+    }
+
+    #[test]
+    fn long_targets_keep_their_names() {
+        // Pinned from 0.4 for the default app: a change renames every long copy.
+        let db = "a".repeat(80);
+        assert_eq!(
+            target_name("wte2e", "feat-x", None, &db),
+            "wt_91dcd45b__aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_8c57aa35"
+        );
+        assert_eq!(
+            target_name("wte2e", "feat-x", Some(&app("coa-api")), &db),
+            "wt_8562b8f3__aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_8c57aa35"
+        );
+    }
+
+    #[test]
+    fn drop_all_never_drops_a_source_database() {
+        let extra = test_env().with_app(&AppId::Extra(app("b")));
+        let a = db("postgres", "app", "wt_p_s__app");
+        // A tampered entry in another app points at the default app's source.
+        let b = db("postgres", "other", "app");
+        let copies = vec![(extra, &b), (test_env(), &a)];
+        let e = format!(
+            "{:#}",
+            drop_all(&copies, true, &BTreeSet::new()).unwrap_err()
+        );
+        assert!(e.contains("source database"), "{e}");
+        let itself = db("postgres", "app", "app");
+        let e = format!(
+            "{:#}",
+            drop_all(&[(test_env(), &itself)], true, &BTreeSet::new()).unwrap_err()
+        );
+        assert!(e.contains("source database"), "{e}");
+        let protected = BTreeSet::from(["wt_p_s__app".to_string()]);
+        let e = format!(
+            "{:#}",
+            drop_all(&[(test_env(), &a)], true, &protected).unwrap_err()
+        );
+        assert!(e.contains("source database"), "{e}");
     }
 }

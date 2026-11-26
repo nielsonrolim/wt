@@ -39,12 +39,16 @@ pub fn run() -> Result<()> {
         let env = Env::new(&cfg, slug);
         let containers: Vec<Container> = all_containers
             .iter()
-            .filter(|c| env.owns(|k| c.label(k)) && !env.owns_helper(|k| c.label(k)))
+            .filter(|c| {
+                env.owns(|k| c.label(k))
+                    && !env.owns_helper(|k| c.label(k))
+                    && env.is_its_app(|k| c.label(k))
+            })
             .cloned()
             .collect();
         let volumes: Vec<_> = all_volumes
             .iter()
-            .filter(|v| env.owns(|k| v.label(k)))
+            .filter(|v| env.owns(|k| v.label(k)) && env.is_its_app(|k| v.label(k)))
             .cloned()
             .collect();
         for c in &containers {
@@ -56,7 +60,7 @@ pub fn run() -> Result<()> {
         }
         let state = State::load(&env.project, &env.slug);
         // Copies whose service left the config still need their column.
-        for copy in &state.databases {
+        for copy in &state.default.databases {
             if let Some(kind) = Kind::from_name(&copy.service)
                 && !kinds.contains(&kind)
             {
@@ -75,7 +79,7 @@ pub fn run() -> Result<()> {
         let mut row = vec![
             env.slug.clone(),
             git::current_branch(&env.path).unwrap_or_else(|| "-".into()),
-            port_cell(state.app_port),
+            port_cell(state.default.app_port),
         ];
         for kind in &kinds {
             let published = containers
@@ -83,7 +87,7 @@ pub fn run() -> Result<()> {
                 .find(|c| env.service_of(c.name(), |k| c.label(k)) == Some(*kind))
                 .and_then(|c| c.host_ports().first().copied());
             row.push(port_cell(
-                published.or(state.ports.get(kind.name()).copied()),
+                published.or(state.default.ports.get(kind.name()).copied()),
             ));
         }
         row.push(status(&cfg, env, containers, !volumes.is_empty(), state, docker_ok).into());
@@ -143,7 +147,7 @@ fn status(
     if !env.path.is_dir() {
         return "orphan";
     }
-    if !docker_ok && !state.databases.is_empty() {
+    if !docker_ok && !state.default.databases.is_empty() {
         return "unknown";
     }
     if !containers.is_empty() {
@@ -155,7 +159,7 @@ fn status(
         };
     }
     if docker_ok
-        && !state.databases.is_empty()
+        && !state.default.databases.is_empty()
         && let Some(verdict) = database_status(state)
     {
         return verdict;
@@ -171,11 +175,11 @@ fn status(
 /// when the worktree has no container of its own. A stopped source (or a
 /// probe that fails) means "cannot tell", never "the copies are gone".
 fn database_status(state: &State) -> Option<&'static str> {
-    if state.databases.is_empty() {
+    if state.default.databases.is_empty() {
         return None;
     }
     let mut existing = 0;
-    for copy in &state.databases {
+    for copy in &state.default.databases {
         // The volume may outlive the container, so a missing source is
         // "cannot tell", not "the copies are gone".
         let Some(container) = docker::container(&copy.source) else {
@@ -191,7 +195,7 @@ fn database_status(state: &State) -> Option<&'static str> {
         }
     }
     Some(match existing {
-        n if n == state.databases.len() => "shared",
+        n if n == state.default.databases.len() => "shared",
         0 => "no-db",
         _ => "partial",
     })

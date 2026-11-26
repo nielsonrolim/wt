@@ -271,6 +271,20 @@ impl AppId {
             AppId::Extra(name) => format!("apps.{name}."),
         }
     }
+
+    /// The name in `wt.app` (and, sanitized, in target names): none for the
+    /// default app, whose resources predate apps and carry no `wt.app`.
+    pub fn label(&self) -> Option<&str> {
+        self.name().map(AppName::as_str)
+    }
+
+    /// The extra app's name; none for the default app.
+    pub fn name(&self) -> Option<&AppName> {
+        match self {
+            AppId::Default => None,
+            AppId::Extra(name) => Some(name),
+        }
+    }
 }
 
 impl std::fmt::Display for AppId {
@@ -285,13 +299,15 @@ impl std::fmt::Display for AppId {
 /// An extra app's name, only built by [`AppName::parse`]: lowercase letters
 /// and digits with single dashes between them, at most 30 characters, never
 /// `default`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AppName(String);
 
 impl AppName {
-    fn parse(name: &str) -> Result<AppName> {
+    /// The bare rule, without a key: callers say where the name came from
+    /// (`apps.<name>`, `--app`, a state file).
+    pub(crate) fn parse(name: &str) -> Result<AppName> {
         if name == "default" {
-            bail!("apps.default: \"default\" is reserved for the top-level app");
+            bail!("\"default\" is reserved for the top-level app");
         }
         let ok = !name.is_empty()
             && name.len() <= 30
@@ -302,22 +318,29 @@ impl AppName {
             && !name.ends_with('-')
             && !name.contains("--");
         if !ok {
-            // Quoted only when the name could not be a TOML bare key
-            // (A-Z, a-z, 0-9, `-`, `_`), as TOML itself would write it.
-            let bare = !name.is_empty()
-                && name
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-            let key = if bare {
-                format!("apps.{name}")
-            } else {
-                format!("apps.{name:?}")
-            };
             bail!(
-                "{key}: an app name is lowercase letters and digits, with single dashes between them, at most 30 characters"
+                "an app name is lowercase letters and digits, with single dashes between them, at most 30 characters"
             );
         }
         Ok(AppName(name.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// `apps.<name>` as TOML would write the key: quoted only when the name could
+/// not be a bare key (A-Z, a-z, 0-9, `-`, `_`).
+fn app_key(name: &str) -> String {
+    let bare = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if bare {
+        format!("apps.{name}")
+    } else {
+        format!("apps.{name:?}")
     }
 }
 
@@ -357,6 +380,22 @@ impl Config {
     /// The default app, then the extras in file order.
     pub fn apps(&self) -> impl Iterator<Item = &AppConfig> {
         std::iter::once(&self.default).chain(&self.extras)
+    }
+
+    /// The app `--app <name>` names; `default` is the top-level one.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "wt up --app reads it in multi-app milestone 3")
+    )]
+    pub fn app(&self, name: &str) -> Result<&AppConfig> {
+        if name == "default" {
+            return Ok(&self.default);
+        }
+        if let Some(app) = self.extras.iter().find(|a| a.id.label() == Some(name)) {
+            return Ok(app);
+        }
+        let known: Vec<String> = self.apps().map(|a| a.id.to_string()).collect();
+        bail!("no app named {name:?}; the apps are: {}", known.join(", "))
     }
 
     /// Every app's services: what `down` must never remove as a clone, even
@@ -636,7 +675,7 @@ fn resolve_app(
 /// An `[apps.<name>]` table: its `dir` is required and supplies the defaults
 /// the default app takes from the root.
 fn resolve_extra(name: &str, raw: RawApp, project: &str) -> Result<AppConfig> {
-    let id = AppId::Extra(AppName::parse(name)?);
+    let id = AppId::Extra(AppName::parse(name).with_context(|| app_key(name))?);
     let Some(dir) = raw.dir else {
         bail!("apps.{name}.dir is required: the app's folder in the worktree");
     };
@@ -739,7 +778,7 @@ fn check_across_apps(default: &AppConfig, extras: &[AppConfig]) -> Result<()> {
 }
 
 /// Two apps on one source: a clone stops it while copies live inside it, so
-/// both must use one mode; and two copies must not land on one target.
+/// both must use one mode; and a worktree copies each source database once.
 fn check_shared_sources(a: &AppConfig, b: &AppConfig) -> Result<()> {
     let (ka, kb) = (a.id.prefix(), b.id.prefix());
     for sa in &a.services {
@@ -760,7 +799,7 @@ fn check_shared_sources(a: &AppConfig, b: &AppConfig) -> Result<()> {
             }
             if sa.databases.is_empty() || sb.databases.is_empty() {
                 bail!(
-                    "{ka}services.{na} and {kb}services.{nb} both copy from {source}; name their databases (database or databases) in both so their copies cannot be the same"
+                    "{ka}services.{na} and {kb}services.{nb} both copy from {source}; name their databases (database or databases) in both, so wt can check they do not copy the same one"
                 );
             }
             for (key, svc) in [
@@ -777,16 +816,30 @@ fn check_shared_sources(a: &AppConfig, b: &AppConfig) -> Result<()> {
                     );
                 }
             }
-            for da in &sa.databases {
-                if let Some(db) = sb
-                    .databases
+            // An extra app's targets carry its name, so the copies would not
+            // clash; one copy per source database and worktree is policy.
+            // With lower_case_table_names set, MySQL stores names lowercased
+            // (1, the Windows default) or compares them without case (2, the
+            // macOS default), so `App` is `app` there. Only MySQL folds case
+            // here; Postgres names are case-sensitive.
+            let same = |x: &String, y: &String| match sa.kind {
+                Kind::Mysql => x.eq_ignore_ascii_case(y),
+                _ => x == y,
+            };
+            if let Some((da, db)) = sa.databases.iter().find_map(|da| {
+                sb.databases
                     .iter()
-                    .find(|db| crate::database::sanitize(db) == crate::database::sanitize(da))
-                {
-                    bail!(
-                        "{ka}services.{na} copies {da:?} and {kb}services.{nb} copies {db:?} from {source}; their copies would get the same name"
-                    );
-                }
+                    .find(|db| same(da, db))
+                    .map(|db| (da, db))
+            }) {
+                let what = if da == db {
+                    format!("{da:?}")
+                } else {
+                    format!("{da:?} (as {db:?})")
+                };
+                bail!(
+                    "{ka}services.{na} and {kb}services.{nb} would both copy {what} from {source}; a worktree gets one copy of each source database"
+                );
             }
         }
     }
@@ -1911,13 +1964,6 @@ after_services = [["mise", "exec", "--", "bin/rails", "db:migrate"]]
             ))
             .is_ok()
         );
-        // app-db and app_db become the same target name.
-        let e = err(&format!(
-            "{}{b}{}",
-            pg_db("", "pg-1", &list("app-db")),
-            pg_db("apps.b.", "pg-1", &list("app_db"))
-        ));
-        assert!(e.contains("app-db") && e.contains("app_db"), "{e}");
         // A detected database cannot be told apart at load.
         for (a, bb) in [("", ""), (list("app").as_str(), "")] {
             let e = err(&format!(
@@ -2060,7 +2106,7 @@ after_services = [["mise", "exec", "--", "bin/rails", "db:migrate"]]
             pg_db("", "pg-1", "databases = [\"app\"]\n"),
             pg_db("apps.b.", "pg-1", "databases = [\"x\", \"app\"]\n")
         ));
-        assert!(e.contains("same name"), "{e}");
+        assert!(e.contains("would both copy \"app\""), "{e}");
     }
 
     #[test]
@@ -2158,6 +2204,80 @@ after_services = [["mise", "exec", "--", "bin/rails", "db:migrate"]]
         assert!(
             e.contains("postgres") && e.contains("mysql") && e.contains("one container"),
             "{e}"
+        );
+    }
+
+    #[test]
+    fn apps_are_found_by_name() {
+        let cfg = load(include_str!("../examples/monorepo.wt.toml")).unwrap();
+        assert_eq!(cfg.app("default").unwrap().id, AppId::Default);
+        assert_eq!(cfg.app("coa-api").unwrap().id.label(), Some("coa-api"));
+        let e = format!("{:#}", cfg.app("nope").unwrap_err());
+        assert!(
+            e.contains("\"nope\"") && e.contains("default, coa-api"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn an_app_name_parses_on_its_own() {
+        let name = AppName::parse("coa-api").unwrap();
+        assert_eq!(name.as_str(), "coa-api");
+        let e = format!("{:#}", AppName::parse("Bad").unwrap_err());
+        assert!(e.starts_with("an app name is"), "{e}");
+        assert!(AppId::Default.label().is_none());
+    }
+
+    #[test]
+    fn two_apps_may_copy_names_that_only_meet_once_sanitized() {
+        // Their targets carry the app, so app-db and app_db do not collide.
+        let b = "[apps.b]\ndir = \"b\"\n";
+        assert!(
+            load(&format!(
+                "{}{b}{}",
+                pg_db("", "pg-1", "databases = [\"app-db\"]\n"),
+                pg_db("apps.b.", "pg-1", "databases = [\"app_db\"]\n")
+            ))
+            .is_ok()
+        );
+        // The same database twice from one source is still refused, as policy.
+        let e = err(&format!(
+            "{}{b}{}",
+            pg_db("", "pg-1", "databases = [\"app\"]\n"),
+            pg_db("apps.b.", "pg-1", "databases = [\"app\"]\n")
+        ));
+        assert!(e.contains("would both copy \"app\" from pg-1"), "{e}");
+    }
+
+    #[test]
+    fn an_empty_app_name_is_not_an_app() {
+        let cfg = load(include_str!("../examples/monorepo.wt.toml")).unwrap();
+        assert!(cfg.app("").is_err());
+    }
+
+    #[test]
+    fn mysql_database_names_compare_without_case() {
+        let my = |prefix: &str, db: &str| {
+            format!(
+                "[{prefix}services.mysql]\nmode = \"database\"\nsource = \"my-1\"\ndatabases = [\"{db}\"]\nenv = {{ U = \"x/{{database}}\" }}\n"
+            )
+        };
+        let e = err(&format!(
+            "{}[apps.b]\ndir = \"b\"\n{}",
+            my("", "App"),
+            my("apps.b.", "app")
+        ));
+        // Both spellings, so the clash is visible.
+        assert!(e.contains("\"App\"") && e.contains("\"app\""), "{e}");
+        // Postgres names are case-sensitive.
+        let b = "[apps.b]\ndir = \"b\"\n";
+        assert!(
+            load(&format!(
+                "{}{b}{}",
+                pg_db("", "pg-1", "databases = [\"App\"]\n"),
+                pg_db("apps.b.", "pg-1", "databases = [\"app\"]\n")
+            ))
+            .is_ok()
         );
     }
 }
