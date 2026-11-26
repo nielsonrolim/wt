@@ -25,7 +25,7 @@ A CLI that gives each git worktree its own development databases and web port. A
 - Markers: `wt.project`, `wt.slug`, `wt.complete` in the Postgres comment or the `__wt_meta` table, written in the same client run as `CREATE DATABASE`. `Missing` creates, `Reuse` reuses, `Recreate` drops and copies, `Foreign` (a marker naming someone else) is refused (and `down --force` may drop it). `Unmarked` (no marker) is refused unless the state lists the copy; then `plan` turns it into `Adopt` when it has tables (keep the data, restore the marker) or `Recreate` when it is empty (never stamp an empty database complete).
 - `down` checks every copy before the first drop, so a refusal drops nothing. Postgres 13+ drops `WITH (FORCE)`.
 - `config::map_placeholders` is the one tokenizer for env values: validation and `render_env` must agree on what is literal.
-- `up` plans and validates every source and target before `state.save` and before the checkout exists. `ls` precedence: `orphan`; `unknown` when Docker is unreachable and copies exist; container status; then the database verdict (`unknown` when a source is stopped or gone, else `shared`/`partial`/`no-db`); then the old `ready`/`no-db`.
+- `up` plans and validates every source and target before `state.save` and before the checkout exists. `ls` has one row per app of a worktree (the default, then extras from the state keys and `wt.app` labels, never from the config alone) and applies its precedence to each app's own containers, volumes and copies: `orphan`; `unknown` when Docker is unreachable and copies exist; container status; then the database verdict (`unknown` when a source is stopped or gone, else `shared`/`partial`/`no-db`); then the old `ready`/`no-db`.
 
 ## Adding a container adapter
 

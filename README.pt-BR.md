@@ -89,12 +89,14 @@ feat-x  feat/x  3001  5433      6380   running  47.69MB+109B
 | `partial` | parte dos containers de pé, ou parte dos bancos copiados registrados sumiu |
 | `stopped` | containers criados, nenhum rodando |
 | `shared` | sem container; todos os bancos copiados registrados no estado existem |
-| `no-db` | checkout sem containers nem bancos copiados (`wt up <branch>` cria) |
-| `ready` | projeto sem serviços, checkout presente |
-| `unknown` | Docker inalcançável, ou uma instância de origem parada ou ausente, e a worktree tem bancos copiados, então o `ls` não sabe dizer |
+| `no-db` | checkout sem containers nem bancos copiados (`wt up <branch>`, ou `--app <nome>` num app extra, cria) |
+| `ready` | app sem serviços, checkout presente |
+| `unknown` | Docker inalcançável, ou uma instância de origem parada ou ausente, e o app tem bancos copiados, então o `ls` não sabe dizer |
 | `orphan` | sobraram recursos, mas o checkout sumiu (`wt down <slug>`) |
 
 `orphan` vem do sistema de arquivos e vence `unknown`; um container da worktree vence o veredito de banco, e uma origem parada ou ausente reporta `unknown` em vez de `no-db`. O `wt ls` nunca muda nada.
+
+Com vários apps no `.wt.toml`, ou numa worktree que ainda tem um app que a config removeu, o `wt ls` acrescenta uma coluna `APP` e uma linha para cada app que a worktree tem: o app padrão (`-`) e todo extra que o arquivo de estado lista ou que está na label `wt.app` de um container ou volume, inclusive um app que a config não tem mais. Portas, status e disco de cada linha vêm dos containers, volumes e cópias daquele app, e o status descreve só aquele app; um app com serviços que foi registrado mas nunca subiu aparece como `no-db`. Uma cópia listada em dois apps aparece uma vez, no app com que o `wt down` a remove. O `wt ls` avisa sobre tudo que o `wt down` removeria e que nenhuma linha mostra: cópias sob uma chave do estado que não é nome de app, e um recurso cuja label `wt.app` não é nome de app.
 
 ### `wt init [--force]`
 
@@ -296,7 +298,7 @@ setup = [["uv", "sync"]]
 
 `wt up <branch>` sobe só o app padrão e avisa quais apps deixou de fora. `wt up <branch> --app coa-api` sobe o coa-api (repita `--app` para mais, `default` é o app do topo), e `--all` sobe todos. O checkout é compartilhado, então a primeira execução o cria, seja qual for o app. A execução de um app só mexe nos containers, volumes, cópias, arquivo de env, `.envrc`, arquivos copiados e hooks dele, e mantém no estado as portas e cópias dos outros apps. Os hooks de `setup` de cada app escolhido rodam na ordem da config (o padrão primeiro), depois todos os serviços sobem, depois os hooks de `after_services`. Um passo da raiz como `bun install` vai no `setup` de cada app que precisa dele. O `dir` de um app precisa ser uma pasta no branch: um arquivo, um symlink ou um submódulo ali é recusado antes de o checkout ser criado. Rode um `wt up` por vez em cada worktree: dois ao mesmo tempo podem salvar o estado um sem o app do outro.
 
-Os containers de um app extra se chamam `<project>-wt-<slug>.<app>-<tipo>` e os volumes `<project>-wt-<slug>.<app>-<tipo>-data`, todos com a label `wt.app=<app>`; as cópias de banco dele são `wt_<project>_<slug>__<app>__<origem>`. Os nomes do app padrão não mudam, e `legacy_names` vale só para ele. Por enquanto, o `wt ls` lista só o app padrão. O `wt down` remove a worktree inteira: todo container e volume com a label do slug dela e toda cópia de banco que o arquivo de estado lista, seja de qual app for.
+Os containers de um app extra se chamam `<project>-wt-<slug>.<app>-<tipo>` e os volumes `<project>-wt-<slug>.<app>-<tipo>-data`, todos com a label `wt.app=<app>`; as cópias de banco dele são `wt_<project>_<slug>__<app>__<origem>`. Os nomes do app padrão não mudam, e `legacy_names` vale só para ele. O `wt ls` mostra uma linha por app da worktree (uma coluna `APP`, `-` no app padrão), cada uma com a própria porta web, portas dos serviços, status e disco. O `wt down` remove a worktree inteira: todo container e volume com a label do slug dela e toda cópia de banco que o arquivo de estado lista, seja de qual app for.
 
 As tabelas `[apps.*]` são conferidas pelo `wt up`, `wt ls` e `wt down`, então uma inválida trava os três. O wt 0.4 e anteriores recusam `[apps.*]` por completo.
 

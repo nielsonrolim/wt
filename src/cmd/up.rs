@@ -773,7 +773,7 @@ fn create_worktree(main: &Path, env: &Env, branch: &str, base: Option<&str>) -> 
     Ok(())
 }
 
-/// The state `up` saves: each app this run brought up gets its fresh entry,
+/// The state `up` saves: each app this run selected gets its fresh entry,
 /// and every other app keeps what the previous run left, so a run for one app
 /// never drops another's ports from the registry or its copies from `down`'s
 /// list.
@@ -1323,7 +1323,7 @@ mod tests {
         };
         let next = next_state(&previous, vec![(AppId::Default, default)]);
         assert_eq!(next.default.app_port, Some(3002));
-        assert_eq!(next.apps, previous.apps);
+        assert_eq!(next.raw_apps(), previous.raw_apps());
         // Bringing up one extra replaces only its own entry.
         let fresh = crate::state::AppState {
             app_port: Some(8002),
@@ -1520,7 +1520,7 @@ mod tests {
         state.default.app_port = Some(3001);
         state.app_mut(&cfg.extras[0].id).app_port = Some(3002);
         // An app removed from the config is not wired into hooks.
-        state.apps.insert(
+        state.raw_apps_mut().insert(
             "gone".into(),
             AppState {
                 app_port: Some(3003),

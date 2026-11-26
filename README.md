@@ -89,12 +89,14 @@ feat-x  feat/x  3001  5433      6380   running  47.69MB+109B
 | `partial` | some containers are up, or some registered database copies are missing |
 | `stopped` | containers created, none running |
 | `shared` | no container; every database copy registered in the state exists |
-| `no-db` | checkout without containers or database copies (`wt up <branch>` creates them) |
-| `ready` | project without services, checkout present |
-| `unknown` | Docker is unreachable, or a source instance is stopped or gone, and the worktree has database copies, so `ls` cannot tell |
+| `no-db` | checkout without containers or database copies (`wt up <branch>`, or `--app <name>` for an extra app, creates them) |
+| `ready` | app without services, checkout present |
+| `unknown` | Docker is unreachable, or a source instance is stopped or gone, and the app has database copies, so `ls` cannot tell |
 | `orphan` | resources left behind, checkout gone (`wt down <slug>`) |
 
 `orphan` is decided from the filesystem and wins over `unknown`; a container of the worktree wins over the database verdict, and a stopped or missing source reports `unknown` rather than `no-db`. `wt ls` never changes anything.
+
+With several apps in `.wt.toml`, or a worktree that still has an app the config dropped, `wt ls` adds an `APP` column and a row for each app a worktree has: the default app (`-`) and every extra the state file lists or a container or volume carries in its `wt.app` label, including an app the config no longer has. Each row's ports, status and disk come from that app's own containers, volumes and copies, and its status describes that app only; an app with services that was recorded but never brought up shows `no-db`. A copy listed under two apps shows once, under the app `wt down` drops it with. `wt ls` warns about anything `wt down` would remove that no row shows: copies under a state key that is not an app name, and a resource whose `wt.app` label is not one.
 
 ### `wt init [--force]`
 
@@ -304,7 +306,7 @@ setup = [["uv", "sync"]]
 
 `wt up <branch>` brings up the default app only, and says which apps it left alone. `wt up <branch> --app coa-api` brings up coa-api (repeat `--app` for more, `default` names the top-level app), and `--all` brings up every app. The checkout is shared, so the first run creates it whatever the app. An app's run touches only its own containers, volumes, copies, env file, `.envrc`, copied files and hooks, and keeps every other app's ports and copies in the state. `setup` hooks run for every selected app in config order (default first), then every service comes up, then the `after_services` hooks. A root-level step such as `bun install` goes in the `setup` of every app that needs it. An app's `dir` must be a folder on the branch: a file, a symlink or a submodule there is refused before the checkout is created. Run one `wt up` at a time per worktree: two at once can each save the state without the other's app.
 
-An extra app's containers are named `<project>-wt-<slug>.<app>-<type>` and its volumes `<project>-wt-<slug>.<app>-<type>-data`, all labelled `wt.app=<app>`; its database copies are `wt_<project>_<slug>__<app>__<source>`. The default app's names are unchanged, and `legacy_names` applies to it only. `wt ls` lists the default app only for now. `wt down` removes the whole worktree: every container and volume labelled with its slug and every database copy its state file lists, whatever their app.
+An extra app's containers are named `<project>-wt-<slug>.<app>-<type>` and its volumes `<project>-wt-<slug>.<app>-<type>-data`, all labelled `wt.app=<app>`; its database copies are `wt_<project>_<slug>__<app>__<source>`. The default app's names are unchanged, and `legacy_names` applies to it only. `wt ls` shows one row per app a worktree has (an `APP` column, `-` for the default app), each with its own web port, service ports, status and disk. `wt down` removes the whole worktree: every container and volume labelled with its slug and every database copy its state file lists, whatever their app.
 
 The `[apps.*]` tables are checked by `wt up`, `wt ls` and `wt down`, so an invalid one stops all three. wt 0.4 and older refuse `[apps.*]` altogether.
 

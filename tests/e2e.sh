@@ -474,6 +474,10 @@ grep -q "cd $MA/apps/web && source .envrc" "$WORK/multi-b.log" && fail "report p
 grep -q '^\[apps.b\]' "$XDG_STATE_HOME/wt/$PROJECT/multi-a.toml" || fail "state has no [apps.b]"
 grep -q 'target = "wt_wte2e_multi_a__b__app"' "$XDG_STATE_HOME/wt/$PROJECT/multi-a.toml" || fail "state lacks app b's copy"
 grep -q 'app b (apps/web)' "$WORK/multi-b.log" || fail "report did not name app b"
+"$WT" ls >"$WORK/multi-ls.log"
+head -1 "$WORK/multi-ls.log" | grep -q '^SLUG *APP *BRANCH' || fail "ls has no APP column: $(head -1 "$WORK/multi-ls.log")"
+awk '$1=="multi-a" && $2=="-" && $3=="multi/a"' "$WORK/multi-ls.log" | grep -q running || fail "ls default row: $(cat "$WORK/multi-ls.log")"
+awk -v p="$B_PORT" '$1=="multi-a" && $2=="b" && $4==p' "$WORK/multi-ls.log" | grep -q running || fail "ls app b row: $(cat "$WORK/multi-ls.log")"
 
 step "several apps: a plain wt up keeps app b's state, and an unknown app is refused"
 sed -n '/^\[apps.b/,$p' "$XDG_STATE_HOME/wt/$PROJECT/multi-a.toml" >"$WORK/multi-b-state"
@@ -509,6 +513,8 @@ REDIS_SOURCE_STARTED="$(docker inspect -f '{{.State.StartedAt}}' "$PROJECT-redis
 grep -q 'apps.d.hooks.after_services\[0\] runs in' "$WORK/multi-d.log" || fail "after_services dir error: $(cat "$WORK/multi-d.log")"
 docker inspect "$PROJECT-wt-multi-a.d-redis" >/dev/null 2>&1 && fail "app d's service came up despite the missing dir"
 [ "$(docker inspect -f '{{.State.StartedAt}}' "$PROJECT-redis-1")" = "$REDIS_SOURCE_STARTED" ] || fail "the source was stopped before the dir check"
+# d is in the state (its ports were saved) but never came up: ls says so.
+"$WT" ls | awk '$1=="multi-a" && $2=="d"' | grep -q 'no-db' || fail "ls shows app d as brought up"
 cp "$WORK/multi.wt.toml" .wt.toml
 
 step "several apps: a re-run refuses an app dir that became a symlink out of the worktree"

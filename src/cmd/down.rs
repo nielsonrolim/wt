@@ -11,7 +11,7 @@ use crate::database;
 use crate::docker;
 use crate::project::{self, Env, LABEL_PROJECT, LABEL_SLUG};
 use crate::services::Kind;
-use crate::state::{DatabaseCopy, State};
+use crate::state::{AppState, DatabaseCopy, State};
 use crate::{git, herdr};
 
 pub struct Options {
@@ -51,7 +51,7 @@ pub fn run(slug_arg: Option<&str>, opts: Options) -> Result<()> {
     let has_checkout = env.path.is_dir();
     // Every app's copies, gathered up front; a state key that is not an app
     // name stops here rather than leave its copies unlisted.
-    let copies = copies_by_app(&env, &state)?;
+    let copies = state.copies_by_app(&env)?;
     if nothing_to_remove(&target, &copies, has_checkout) {
         State::remove(&env.project, &env.slug);
         bail!("nothing to remove for {slug}");
@@ -244,38 +244,6 @@ fn not_labelled(env: &Env) -> String {
     text
 }
 
-/// Every app's copies with the environment that names them: the default app's
-/// with `env`, each extra's with `env` seen as that app. Run before anything is
-/// dropped: a table whose key is not an app name and that lists copies refuses
-/// the whole `down`, since nothing else knows whose copies they are.
-fn copies_by_app<'a>(env: &Env, state: &'a State) -> Result<Vec<(Env, &'a DatabaseCopy)>> {
-    let mut out: Vec<(Env, &DatabaseCopy)> = state
-        .default
-        .databases
-        .iter()
-        .map(|c| (env.clone(), c))
-        .collect();
-    for (key, id, app) in state.extras() {
-        let id = match id {
-            Ok(id) => id,
-            Err(_) if app.databases.is_empty() => continue,
-            Err(e) => {
-                let file = crate::state::path(&env.project, &env.slug);
-                return Err(e.context(format!(
-                    "apps.{key:?} in {} lists database copies but is not an app name; rename or remove that table",
-                    file.display()
-                )));
-            }
-        };
-        out.extend(app.databases.iter().map(|c| (env.clone().with_app(&id), c)));
-    }
-    // A copy listed twice (by hand, or under two apps) is dropped once: the
-    // second DROP would fail after the first ran and leave the state stale.
-    let mut seen = BTreeSet::new();
-    out.retain(|(_, c)| seen.insert((c.source.clone(), c.target.clone())));
-    Ok(out)
-}
-
 /// What `down` does with the state file once it has removed what it could.
 #[derive(Debug, PartialEq, Eq)]
 enum StateAfter {
@@ -305,13 +273,14 @@ fn nothing_to_remove(target: &Target, copies: &[(Env, &DatabaseCopy)], has_check
 /// removed; an app left with nothing disappears.
 fn kept_state(state: &State, docker_ok: bool) -> State {
     let mut kept = state.clone();
-    for app in std::iter::once(&mut kept.default).chain(kept.apps.values_mut()) {
+    let clear = |app: &mut AppState| {
         app.databases.clear();
         if docker_ok {
             app.ports.clear();
         }
-    }
-    kept.apps.retain(|_, app| {
+    };
+    kept.all_mut().for_each(clear);
+    kept.retain_extras(|app| {
         app.app_port.is_some() || !app.ports.is_empty() || !app.databases.is_empty()
     });
     kept
@@ -539,14 +508,14 @@ mod tests {
         };
         let mut state = State::default();
         state.default.databases.push(copy("wt_myapp_feat_x__app"));
-        state.apps.insert(
+        state.raw_apps_mut().insert(
             "b".into(),
             AppState {
                 databases: vec![copy("wt_myapp_feat_x__b__app")],
                 ..Default::default()
             },
         );
-        let pairs = copies_by_app(&env, &state).unwrap();
+        let pairs = state.copies_by_app(&env).unwrap();
         let seen: Vec<(Option<&str>, &str)> = pairs
             .iter()
             .map(|(e, c)| (e.app.label(), c.target.as_str()))
@@ -560,14 +529,14 @@ mod tests {
         );
         assert_eq!(pairs[1].0.app, AppId::Extra(AppName::parse("b").unwrap()));
         // A key no app name could be: never guess whose copies those are.
-        state.apps.insert(
+        state.raw_apps_mut().insert(
             "Bad Key".into(),
             AppState {
                 databases: vec![copy("x")],
                 ..Default::default()
             },
         );
-        assert!(copies_by_app(&env, &state).is_err());
+        assert!(state.copies_by_app(&env).is_err());
     }
 
     fn copy(target: &str) -> crate::state::DatabaseCopy {
@@ -585,7 +554,7 @@ mod tests {
         state.default.app_port = Some(3001);
         state.default.ports.insert("postgres".into(), 5433);
         state.default.databases.push(copy("a"));
-        state.apps.insert(
+        state.raw_apps_mut().insert(
             "web".into(),
             AppState {
                 app_port: Some(8001),
@@ -593,7 +562,7 @@ mod tests {
                 databases: vec![copy("b")],
             },
         );
-        state.apps.insert(
+        state.raw_apps_mut().insert(
             "worker".into(),
             AppState {
                 ports: [("postgres".to_string(), 5434)].into(),
@@ -609,8 +578,8 @@ mod tests {
         let kept = kept_state(&three_apps_state(), true);
         assert_eq!(kept.default.app_port, Some(3001));
         assert!(kept.default.ports.is_empty() && kept.default.databases.is_empty());
-        assert_eq!(kept.apps.len(), 1, "{kept:?}");
-        let web = &kept.apps["web"];
+        assert_eq!(kept.raw_apps().len(), 1, "{kept:?}");
+        let web = &kept.raw_apps()["web"];
         assert_eq!(web.app_port, Some(8001));
         assert!(web.ports.is_empty() && web.databases.is_empty());
         assert_eq!(
@@ -624,8 +593,8 @@ mod tests {
         // No container was touched, so their ports still belong to them.
         let kept = kept_state(&three_apps_state(), false);
         assert_eq!(kept.default.ports["postgres"], 5433);
-        assert_eq!(kept.apps["worker"].ports["postgres"], 5434);
-        assert!(kept.apps.values().all(|a| a.databases.is_empty()));
+        assert_eq!(kept.raw_apps()["worker"].ports["postgres"], 5434);
+        assert!(kept.raw_apps().values().all(|a| a.databases.is_empty()));
     }
 
     #[test]
@@ -633,14 +602,14 @@ mod tests {
         let cfg = two_apps();
         let env = Env::new(&cfg, "feat-x");
         let mut state = State::default();
-        state.apps.insert(
+        state.raw_apps_mut().insert(
             "b".into(),
             crate::state::AppState {
                 databases: vec![copy("wt_myapp_feat_x__b__app")],
                 ..Default::default()
             },
         );
-        let copies = copies_by_app(&env, &state).unwrap();
+        let copies = state.copies_by_app(&env).unwrap();
         let none = Target {
             containers: BTreeSet::new(),
             volumes: BTreeSet::new(),
@@ -655,21 +624,21 @@ mod tests {
         let cfg = two_apps();
         let env = Env::new(&cfg, "feat-x");
         let mut state = State::default();
-        state.apps.insert(
+        state.raw_apps_mut().insert(
             "Bad Key".into(),
             crate::state::AppState {
                 app_port: Some(8001),
                 ..Default::default()
             },
         );
-        assert!(copies_by_app(&env, &state).unwrap().is_empty());
+        assert!(state.copies_by_app(&env).unwrap().is_empty());
         state
-            .apps
+            .raw_apps_mut()
             .get_mut("Bad Key")
             .unwrap()
             .databases
             .push(copy("x"));
-        let e = format!("{:#}", copies_by_app(&env, &state).unwrap_err());
+        let e = format!("{:#}", state.copies_by_app(&env).unwrap_err());
         assert!(
             e.starts_with("apps.\"Bad Key\" in ")
                 && e.contains("feat-x.toml lists database copies"),
@@ -705,7 +674,7 @@ mod tests {
         let env = Env::new(&cfg, "feat-x");
         let mut state = State::default();
         state.default.databases.push(copy("wt_myapp_feat_x__app"));
-        state.apps.insert(
+        state.raw_apps_mut().insert(
             "b".into(),
             crate::state::AppState {
                 databases: vec![
@@ -715,7 +684,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        let targets: Vec<&str> = copies_by_app(&env, &state)
+        let targets: Vec<&str> = state
+            .copies_by_app(&env)
             .unwrap()
             .iter()
             .map(|(_, c)| c.target.as_str())
