@@ -138,7 +138,7 @@ volumes:
   pg-noport-data:
   z-nested-data:
 EOF
-printf '/.env*\n/.envrc\nhook-*.out\n/storage/*\n!/storage/.keep\n/agents/\n' >.gitignore
+printf '.env*\n.envrc\nhook-*.out\n/storage/*\n!/storage/.keep\n/agents/\n' >.gitignore
 touch storage/.keep
 mkdir -p apps/web && touch apps/web/.keep
 printf 'SECRET=main\nDB_PORT=5432\n' >.env
@@ -403,6 +403,174 @@ git show-ref --verify --quiet refs/heads/feat/x || fail "branch deleted without 
 git show-ref --verify --quiet refs/heads/feat/y && fail "--delete-branch kept the branch"
 docker volume inspect "${PROJECT}_pg-data" >/dev/null || fail "source volume touched"
 "$WT" ls | grep -q 'No worktree environments' || fail "ls not empty"
+
+# ---------------------------------------------------------------------------
+# Several apps: the default app plus [apps.b] in apps/web.
+# ---------------------------------------------------------------------------
+step "several apps: wt up brings up the default app only"
+# App b's folder tracks its own .envrc: wt must leave it alone.
+printf 'export TRACKED=1\n' >apps/web/.envrc
+git add -f apps/web/.envrc && git commit --quiet -m "app b tracks its .envrc"
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[services.redis]
+
+[hooks]
+setup = [["sh", "-c", "echo \$WT_APP:\$WT_APP_PORT > hook-app.out"]]
+
+[apps.b]
+dir = "apps/web"
+
+[apps.b.app]
+port_env = "B_PORT"
+
+[apps.b.services.redis]
+source = "$PROJECT-redis-1"
+
+[apps.b.services.postgres]
+source = "$PROJECT-postgres-1"
+mode = "database"
+databases = ["app"]
+env = { B_DATABASE_URL = "postgres://app:app@127.0.0.1:{port}/{database}" }
+
+[apps.b.hooks]
+setup = [["sh", "-c", "echo \$WT_APP:\$WT_APP_PORT:\$WT_APP_PORT_DEFAULT:\$WT_APP_DIR:\$WT_APP_PORT_B > hook-app.out"]]
+EOF
+MA="$WORK/root/multi-a"
+"$WT" up multi/a | tee "$WORK/multi-default.log"
+grep -q 'also in .wt.toml: b' "$WORK/multi-default.log" || fail "up did not name the app it left alone"
+docker inspect "$PROJECT-wt-multi-a-redis" >/dev/null 2>&1 || fail "default redis clone missing"
+docker inspect "$PROJECT-wt-multi-a.b-redis" >/dev/null 2>&1 && fail "up brought up app b without --app"
+[ -e "$MA/apps/web/.env" ] && fail "up wrote app b's env file without --app"
+[ "$(docker exec "$PROJECT-postgres-1" psql -qtAX -U app -d postgres -c "select count(*) from pg_database where datname = 'wt_wte2e_multi_a__b__app'")" = 0 ] ||
+  fail "up copied app b's database without --app"
+[ "$(cat "$MA/hook-app.out")" = ":$(sed -n 's/^PORT=//p' "$MA/.env")" ] || fail "default hook env: $(cat "$MA/hook-app.out")"
+
+step "several apps: --app b brings up b alone, with its own names, port and copy"
+DEFAULT_REDIS_STARTED="$(docker inspect -f '{{.State.StartedAt}}' "$PROJECT-wt-multi-a-redis")"
+cp "$MA/.env" "$WORK/multi-default.env"
+PG_SOURCE_STARTED="$(docker inspect -f '{{.State.StartedAt}}' "$PROJECT-postgres-1")"
+"$WT" up multi/a --app b | tee "$WORK/multi-b.log"
+docker inspect "$PROJECT-wt-multi-a.b-redis" >/dev/null || fail "app b redis clone missing"
+[ "$(docker inspect -f '{{index .Config.Labels "wt.app"}}' "$PROJECT-wt-multi-a.b-redis")" = b ] || fail "app b clone lacks wt.app"
+[ "$(docker inspect -f '{{index .Config.Labels "wt.app"}}' "$PROJECT-wt-multi-a-redis")" = "" ] || fail "default clone got wt.app"
+docker volume inspect "$PROJECT-wt-multi-a.b-redis-data" >/dev/null || fail "app b volume missing"
+[ "$(docker inspect -f '{{.State.StartedAt}}' "$PROJECT-wt-multi-a-redis")" = "$DEFAULT_REDIS_STARTED" ] || fail "--app b restarted the default clone"
+cmp -s "$MA/.env" "$WORK/multi-default.env" || fail "--app b rewrote the default app's .env"
+[ "$(docker inspect -f '{{.State.StartedAt}}' "$PROJECT-postgres-1")" = "$PG_SOURCE_STARTED" ] || fail "database mode stopped the source"
+[ "$(docker exec "$PROJECT-postgres-1" psql -qtAX -U app -d postgres -c "select shobj_description(oid,'pg_database') from pg_database where datname = 'wt_wte2e_multi_a__b__app'")" = "wt.project=wte2e;wt.slug=multi-a;wt.complete=1" ] ||
+  fail "app b copy missing or unmarked"
+PG_HOST="$(docker port "$PROJECT-postgres-1" 5432/tcp | sed 's/.*://')"
+grep -q "^B_DATABASE_URL=postgres://app:app@127.0.0.1:$PG_HOST/wt_wte2e_multi_a__b__app$" "$MA/apps/web/.env" || fail "app b DATABASE_URL"
+B_PORT="$(sed -n 's/^B_PORT=//p' "$MA/apps/web/.env")"
+DEFAULT_PORT="$(sed -n 's/^PORT=//p' "$MA/.env")"
+[ -n "$B_PORT" ] && [ "$B_PORT" != "$DEFAULT_PORT" ] || fail "app b web port $B_PORT vs default $DEFAULT_PORT"
+[ "$(cat "$MA/apps/web/.envrc")" = "export TRACKED=1" ] || fail "wt overwrote app b's tracked .envrc"
+grep -q 'Skipping apps/web/.envrc: the repo tracks its own' "$WORK/multi-b.log" || fail "no skip note for the tracked .envrc"
+grep -q "cd $MA/apps/web && source .envrc" "$WORK/multi-b.log" && fail "report points at an .envrc wt did not write"
+# WT_APP_PORT_B is set on b's first run: the ports come from this run's state.
+[ "$(cat "$MA/apps/web/hook-app.out")" = "b:$B_PORT:$DEFAULT_PORT:$MA/apps/web:$B_PORT" ] || fail "app b hook env: $(cat "$MA/apps/web/hook-app.out")"
+grep -q '^\[apps.b\]' "$XDG_STATE_HOME/wt/$PROJECT/multi-a.toml" || fail "state has no [apps.b]"
+grep -q 'target = "wt_wte2e_multi_a__b__app"' "$XDG_STATE_HOME/wt/$PROJECT/multi-a.toml" || fail "state lacks app b's copy"
+grep -q 'app b (apps/web)' "$WORK/multi-b.log" || fail "report did not name app b"
+
+step "several apps: a plain wt up keeps app b's state, and an unknown app is refused"
+sed -n '/^\[apps.b/,$p' "$XDG_STATE_HOME/wt/$PROJECT/multi-a.toml" >"$WORK/multi-b-state"
+"$WT" up multi/a >/dev/null
+sed -n '/^\[apps.b/,$p' "$XDG_STATE_HOME/wt/$PROJECT/multi-a.toml" | cmp -s - "$WORK/multi-b-state" || fail "a default up changed app b's state"
+"$WT" up multi/a --app nope >"$WORK/multi-nope.log" 2>&1 && fail "up accepted an unknown app"
+grep -q 'the apps are: default, b' "$WORK/multi-nope.log" || fail "unknown app error: $(cat "$WORK/multi-nope.log")"
+
+step "several apps: --all is the same as naming every app, and keeps app b's port"
+"$WT" up multi/a --all >"$WORK/multi-all.log"
+[ "$(sed -n 's/^B_PORT=//p' "$MA/apps/web/.env")" = "$B_PORT" ] || fail "--all moved app b's web port"
+grep -q 'Bringing up default, b$' "$WORK/multi-all.log" || fail "--all did not bring up every app: $(cat "$WORK/multi-all.log")"
+
+step "several apps: an app's missing after_services dir stops up before its services"
+cp .wt.toml "$WORK/multi.wt.toml"
+cat >>.wt.toml <<EOF
+
+[apps.d]
+dir = "apps/web"
+
+[apps.d.app]
+env_file = "apps/web/.env.d"
+port_env = ""
+
+[apps.d.services.redis]
+source = "$PROJECT-redis-1"
+
+[apps.d.hooks]
+after_services = [{ run = ["true"], dir = "apps/web/nope" }]
+EOF
+REDIS_SOURCE_STARTED="$(docker inspect -f '{{.State.StartedAt}}' "$PROJECT-redis-1")"
+"$WT" up multi/a --app d >"$WORK/multi-d.log" 2>&1 && fail "up accepted a missing after_services dir"
+grep -q 'apps.d.hooks.after_services\[0\] runs in' "$WORK/multi-d.log" || fail "after_services dir error: $(cat "$WORK/multi-d.log")"
+docker inspect "$PROJECT-wt-multi-a.d-redis" >/dev/null 2>&1 && fail "app d's service came up despite the missing dir"
+[ "$(docker inspect -f '{{.State.StartedAt}}' "$PROJECT-redis-1")" = "$REDIS_SOURCE_STARTED" ] || fail "the source was stopped before the dir check"
+cp "$WORK/multi.wt.toml" .wt.toml
+
+step "several apps: a re-run refuses an app dir that became a symlink out of the worktree"
+mv "$MA/apps/web" "$WORK/web.real"
+ln -s "$WORK" "$MA/apps/web"
+"$WT" up multi/a --app b >"$WORK/multi-link.log" 2>&1 && fail "up wrote into a symlinked app dir"
+grep -q 'apps.b.dir is .*leaves the worktree' "$WORK/multi-link.log" || fail "symlinked app dir error: $(cat "$WORK/multi-link.log")"
+rm "$MA/apps/web"
+mv "$WORK/web.real" "$MA/apps/web"
+
+step "several apps: a reused worktree takes an app dir that exists only in its checkout"
+cp .wt.toml "$WORK/multi.wt.toml"
+printf '\n[apps.e]\ndir = "apps/local"\n\n[apps.e.app]\nport_env = ""\n' >>.wt.toml
+mkdir -p "$MA/apps/local"
+"$WT" up multi/a --app e >"$WORK/multi-e.log" 2>&1 || fail "a reused worktree refused its own app dir: $(cat "$WORK/multi-e.log")"
+rmdir "$MA/apps/local"
+cp "$WORK/multi.wt.toml" .wt.toml
+
+step "several apps: an app left out of the run still counts against a copy of its database"
+PG_ID="$(docker inspect -f '{{.Id}}' "$PROJECT-postgres-1")"
+cat >.wt.toml <<EOF
+root = "$WORK/root"
+
+[services.postgres]
+mode = "database"
+databases = ["app"]
+env = { DATABASE_URL = "postgres://app:app@127.0.0.1:{port}/{database}" }
+
+[apps.b]
+dir = "apps/web"
+
+[apps.b.app]
+port_env = "B_PORT"
+
+[apps.b.services.postgres]
+source = "$PG_ID"
+mode = "database"
+databases = ["app"]
+env = { B_DATABASE_URL = "postgres://app:app@127.0.0.1:{port}/{database}" }
+EOF
+"$WT" up multi/a --app b >"$WORK/multi-same-db.log" 2>&1 && fail "two apps copied one database from one source"
+grep -q 'would both copy "app" from container' "$WORK/multi-same-db.log" || fail "same database error: $(cat "$WORK/multi-same-db.log")"
+cp "$WORK/multi.wt.toml" .wt.toml
+
+step "several apps: an app whose dir the branch lacks is refused before the checkout"
+cp .wt.toml "$WORK/multi.wt.toml"
+printf '\n[apps.c]\ndir = "apps/nope"\n' >>.wt.toml
+"$WT" up multi/z --app c >"$WORK/multi-nodir.log" 2>&1 && fail "up accepted an app dir the branch lacks"
+grep -q 'apps.c.dir = "apps/nope" is not a folder on HEAD' "$WORK/multi-nodir.log" || fail "missing app dir error: $(cat "$WORK/multi-nodir.log")"
+[ ! -e "$WORK/root/multi-z" ] || fail "a refused app dir left a checkout"
+[ ! -e "$XDG_STATE_HOME/wt/$PROJECT/multi-z.toml" ] || fail "a refused app dir left a state file"
+git show-ref --verify --quiet refs/heads/multi/z && fail "a refused app dir created the branch"
+cp "$WORK/multi.wt.toml" .wt.toml
+
+step "several apps: down removes every app's containers, volumes and copies"
+"$WT" down multi-a --yes >"$WORK/multi-down.log"
+grep -q 'wt_wte2e_multi_a__b__app (source .*, app b)' "$WORK/multi-down.log" || fail "down did not list app b's copy: $(cat "$WORK/multi-down.log")"
+[ -z "$(docker ps -aq --filter "label=wt.slug=multi-a")" ] || fail "containers left"
+[ -z "$(docker volume ls -q --filter "label=wt.slug=multi-a")" ] || fail "volumes left"
+[ "$(docker exec "$PROJECT-postgres-1" psql -qtAX -U app -d postgres -c "select count(*) from pg_database where datname like 'wt_wte2e_multi_a%'")" = 0 ] || fail "app b copy left"
+[ ! -e "$XDG_STATE_HOME/wt/$PROJECT/multi-a.toml" ] || fail "state left"
+docker exec "$PROJECT-postgres-1" psql -qtAX -U app -d app -c 'select 1' >/dev/null || fail "source database touched"
 
 # ---------------------------------------------------------------------------
 # Database mode: copies logical databases inside the source instance.

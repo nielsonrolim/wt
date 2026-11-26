@@ -272,6 +272,12 @@ impl AppId {
         }
     }
 
+    /// A key under this app in `.wt.toml`: `hooks.setup`, or
+    /// `apps.<name>.hooks.setup` for an extra.
+    pub fn key(&self, rest: &str) -> String {
+        format!("{}{rest}", self.prefix())
+    }
+
     /// The name in `wt.app` (and, sanitized, in target names): none for the
     /// default app, whose resources predate apps and carry no `wt.app`.
     pub fn label(&self) -> Option<&str> {
@@ -382,11 +388,24 @@ impl Config {
         std::iter::once(&self.default).chain(&self.extras)
     }
 
+    /// The apps `wt up` brings up: the default app alone without `--app`,
+    /// every app with `--all`, else the named ones, each once and in config
+    /// order (default first, then file order) whatever order they were typed.
+    pub fn select(&self, names: &[String], all: bool) -> Result<Vec<&AppConfig>> {
+        if all {
+            return Ok(self.apps().collect());
+        }
+        if names.is_empty() {
+            return Ok(vec![&self.default]);
+        }
+        let mut picked = Vec::new();
+        for name in names {
+            picked.push(self.app(name)?.id.clone());
+        }
+        Ok(self.apps().filter(|a| picked.contains(&a.id)).collect())
+    }
+
     /// The app `--app <name>` names; `default` is the top-level one.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "wt up --app reads it in multi-app milestone 3")
-    )]
     pub fn app(&self, name: &str) -> Result<&AppConfig> {
         if name == "default" {
             return Ok(&self.default);
@@ -818,14 +837,7 @@ fn check_shared_sources(a: &AppConfig, b: &AppConfig) -> Result<()> {
             }
             // An extra app's targets carry its name, so the copies would not
             // clash; one copy per source database and worktree is policy.
-            // With lower_case_table_names set, MySQL stores names lowercased
-            // (1, the Windows default) or compares them without case (2, the
-            // macOS default), so `App` is `app` there. Only MySQL folds case
-            // here; Postgres names are case-sensitive.
-            let same = |x: &String, y: &String| match sa.kind {
-                Kind::Mysql => x.eq_ignore_ascii_case(y),
-                _ => x == y,
-            };
+            let same = |x: &String, y: &String| sa.kind.same_database(x, y);
             if let Some((da, db)) = sa.databases.iter().find_map(|da| {
                 sb.databases
                     .iter()
@@ -2278,6 +2290,48 @@ after_services = [["mise", "exec", "--", "bin/rails", "db:migrate"]]
                 pg_db("apps.b.", "pg-1", "databases = [\"app\"]\n")
             ))
             .is_ok()
+        );
+    }
+
+    fn three_apps() -> Config {
+        load("[apps.web]\ndir = \"web\"\n[apps.api]\ndir = \"api\"").unwrap()
+    }
+
+    fn names(apps: Vec<&AppConfig>) -> Vec<String> {
+        apps.iter().map(|a| a.id.to_string()).collect()
+    }
+
+    #[test]
+    fn select_defaults_to_the_default_app() {
+        assert_eq!(names(three_apps().select(&[], false).unwrap()), ["default"]);
+    }
+
+    #[test]
+    fn select_keeps_config_order_and_drops_repeats() {
+        let cfg = three_apps();
+        let picked = cfg
+            .select(
+                &["api".into(), "default".into(), "api".into(), "web".into()],
+                false,
+            )
+            .unwrap();
+        assert_eq!(names(picked), ["default", "web", "api"]);
+        assert_eq!(names(cfg.select(&["api".into()], false).unwrap()), ["api"]);
+        assert_eq!(
+            names(cfg.select(&[], true).unwrap()),
+            ["default", "web", "api"]
+        );
+    }
+
+    #[test]
+    fn select_refuses_an_unknown_app() {
+        let e = format!(
+            "{:#}",
+            three_apps().select(&["nope".into()], false).unwrap_err()
+        );
+        assert!(
+            e.contains("\"nope\"") && e.contains("default, web, api"),
+            "{e}"
         );
     }
 }

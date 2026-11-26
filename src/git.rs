@@ -126,6 +126,25 @@ pub fn dirty(path: &Path) -> String {
     sh::output(git(path).args(["status", "--porcelain"])).unwrap_or_default()
 }
 
+/// Whether `rev` names a commit.
+pub fn is_commit(repo: &Path, rev: &str) -> bool {
+    sh::succeeds(git(repo).args([
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        &format!("{rev}^{{commit}}"),
+    ]))
+}
+
+/// What `path` is in the commit `rev` (`tree`, `blob`, `commit` for a
+/// submodule), or none when the commit lacks it. Check `is_commit` first:
+/// for a bad `rev` this says none too.
+pub fn object_type(repo: &Path, rev: &str, path: &str) -> Option<String> {
+    sh::output(git(repo).args(["cat-file", "-t", &format!("{rev}:{path}")]))
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
 pub fn is_tracked(repo: &Path, rel: &str) -> bool {
     sh::succeeds(git(repo).args(["ls-files", "--error-unmatch", rel]))
 }
