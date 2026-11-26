@@ -405,6 +405,11 @@ impl Config {
         Ok(self.apps().filter(|a| picked.contains(&a.id)).collect())
     }
 
+    /// The configured app with this id, none for an app the config dropped.
+    pub fn app_by_id(&self, id: &AppId) -> Option<&AppConfig> {
+        self.apps().find(|a| a.id == *id)
+    }
+
     /// The app `--app <name>` names; `default` is the top-level one.
     pub fn app(&self, name: &str) -> Result<&AppConfig> {
         if name == "default" {

@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{self, AppId, AppName};
+use crate::project::Env;
 
 /// One worktree's state. The default app's fields sit at the top level, as in
 /// a state file from before apps, so 0.4 files read and write unchanged.
@@ -18,11 +19,13 @@ use crate::config::{self, AppId, AppName};
 pub struct State {
     #[serde(flatten)]
     pub default: AppState,
-    /// What `wt up` gave each extra app it brought up, keyed by its name. Keys
-    /// are parsed in [`State::extras`], not here: one bad key must not make
-    /// `load` drop the whole registry.
+    /// What `wt up` recorded for each extra app it was asked for (`--app`,
+    /// `--all`), keyed by its name. A key is saved before the app's services
+    /// start, so it means "asked for", not "brought up". Keys are parsed in
+    /// [`State::extras`], not here: one bad key must not make `load` drop the
+    /// whole registry.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub apps: BTreeMap<String, AppState>,
+    apps: BTreeMap<String, AppState>,
 }
 
 /// One app's share of a worktree's state.
@@ -144,6 +147,61 @@ impl State {
         self.apps
             .iter()
             .map(|(key, app)| (key.as_str(), AppName::parse(key).map(AppId::Extra), app))
+    }
+
+    /// Every app's state to change in place, the default app first.
+    pub fn all_mut(&mut self) -> impl Iterator<Item = &mut AppState> {
+        std::iter::once(&mut self.default).chain(self.apps.values_mut())
+    }
+
+    /// Keeps only the extra apps `keep` says yes to.
+    pub fn retain_extras(&mut self, mut keep: impl FnMut(&AppState) -> bool) {
+        self.apps.retain(|_, app| keep(app));
+    }
+
+    /// The extra apps' table as stored, keys as written: for tests that need
+    /// a key no app name could be, or to compare the table whole.
+    #[cfg(test)]
+    pub fn raw_apps(&self) -> &BTreeMap<String, AppState> {
+        &self.apps
+    }
+
+    #[cfg(test)]
+    pub fn raw_apps_mut(&mut self) -> &mut BTreeMap<String, AppState> {
+        &mut self.apps
+    }
+
+    /// Every app's copies with the environment that names them: the default
+    /// app's with `env`, each extra's with `env` seen as that app. A table
+    /// whose key is not an app name and that lists copies is an error, since
+    /// nothing else knows whose copies they are; a copy listed twice (by
+    /// hand, or under two apps) comes once.
+    pub fn copies_by_app<'a>(&'a self, env: &Env) -> Result<Vec<(Env, &'a DatabaseCopy)>> {
+        let mut out: Vec<(Env, &DatabaseCopy)> = self
+            .default
+            .databases
+            .iter()
+            .map(|c| (env.clone(), c))
+            .collect();
+        for (key, id, app) in self.extras() {
+            let id = match id {
+                Ok(id) => id,
+                Err(_) if app.databases.is_empty() => continue,
+                Err(e) => {
+                    let file = path(&env.project, &env.slug);
+                    return Err(e.context(format!(
+                        "apps.{key:?} in {} lists database copies but is not an app name; rename or remove that table",
+                        file.display()
+                    )));
+                }
+            };
+            out.extend(app.databases.iter().map(|c| (env.clone().with_app(&id), c)));
+        }
+        // A second DROP of the same copy would fail after the first ran and
+        // leave the state stale.
+        let mut seen = std::collections::BTreeSet::new();
+        out.retain(|(_, c)| seen.insert((c.source.clone(), c.target.clone())));
+        Ok(out)
     }
 
     /// Every app's ports, so the cross-project registry never hands out one
@@ -294,7 +352,7 @@ target = "wt_myapp_feat_x__app_cache"
         assert_eq!(state.default.app_port, Some(3001));
         assert_eq!(state.default.ports["redis"], 6380);
         assert_eq!(state.default.databases.len(), 2);
-        assert!(state.apps.is_empty());
+        assert!(state.raw_apps().is_empty());
         assert_eq!(toml::to_string(&state).unwrap(), STATE_0_4);
     }
 
